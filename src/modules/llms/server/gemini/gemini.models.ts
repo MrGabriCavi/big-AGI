@@ -2,7 +2,7 @@ import type { GeminiWire_API_Models_List } from '~/modules/aix/server/dispatch/w
 
 import type { ModelDescriptionSchema } from '../llm.server.types';
 
-import { LLM_IF_GEM_CodeExecution, LLM_IF_HOTFIX_StripImages, LLM_IF_HOTFIX_StripSys0, LLM_IF_HOTFIX_Sys0ToUsr0, LLM_IF_OAI_Chat, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_OAI_Vision, LLM_IF_Outputs_Audio, LLM_IF_Outputs_Image } from '~/common/stores/llms/llms.types';
+import { LLM_IF_GEM_CodeExecution, LLM_IF_HOTFIX_NoStream, LLM_IF_HOTFIX_StripImages, LLM_IF_HOTFIX_StripSys0, LLM_IF_HOTFIX_Sys0ToUsr0, LLM_IF_OAI_Chat, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_OAI_Vision, LLM_IF_Outputs_Audio, LLM_IF_Outputs_Image, LLM_IF_Outputs_NoText } from '~/common/stores/llms/llms.types';
 
 
 // dev options
@@ -14,13 +14,13 @@ const geminiChatInterfaces: GeminiWire_API_Models_List.Model['supportedGeneratio
 
 // unsupported interfaces
 const filterUnallowedNames = ['Legacy'];
-const filterUnallowedInterfaces: GeminiWire_API_Models_List.Model['supportedGenerationMethods'] = [
-  'generateAnswer',     // e.g. removes "models/aqa"
-  'embedContent',       // e.g. removes "models/embedding-001"
-  'embedText',          // e.g. removes "models/text-embedding-004"
-  'predict',            // e.g. removes "models/imagen-3.0-generate-002" (appeared on 2025-02-09)
-  'predictLongRunning', // e.g. removes "models/veo-2.0-generate-001" (appeared on 2025-04-10)
-];
+// const filterUnallowedInterfaces: GeminiWire_API_Models_List.Model['supportedGenerationMethods'] = [
+//   'generateAnswer',     // e.g. removes "models/aqa"
+//   'embedContent',       // e.g. removes "models/embedding-001"
+//   'embedText',          // e.g. removes "models/text-embedding-004"
+//   'predict',            // e.g. removes "models/imagen-3.0-generate-002" (appeared on 2025-02-09)
+//   'predictLongRunning', // e.g. removes "models/veo-2.0-generate-001" (appeared on 2025-04-10)
+// ];
 const filterLyingModelNames: GeminiWire_API_Models_List.Model['name'][] = [
   // 2025-02-27: verified, old model is no more
   'models/gemini-2.0-flash-exp', // verified, replaced by gemini-2.0-flash, which is non-free anymore
@@ -38,7 +38,7 @@ const filterLyingModelNames: GeminiWire_API_Models_List.Model['name'][] = [
    - Latest stable     version  gemini-1.0-pro  <model>-<generation>-<variation>
    - Stable versions   gemini-1.0-pro-001       <model>-<generation>-<variation>-<version>
 
-   Gemini capabilities chart (updated 2025-04-17):
+   Gemini capabilities chart (updated 2025-05-27):
    - [table stakes] System instructions
    - JSON Mode, with optional JSON Schema
    - Adjustable Safety Settings
@@ -49,6 +49,8 @@ const filterLyingModelNames: GeminiWire_API_Models_List.Model['name'][] = [
    - Thinking / Reasoning with thinking budget
    - Audio generation
    - Live API
+   - Native Audio (dialog models)
+   - Text-to-Speech models
 */
 
 // Experimental Gemini models are Free of charge
@@ -57,7 +59,7 @@ const geminiExpFree: ModelDescriptionSchema['chatPrice'] = {
 };
 
 
-// Pricing based on https://ai.google.dev/pricing (May 12, 2025)
+// Pricing based on https://ai.google.dev/pricing (May 27, 2025)
 
 const gemini25ProPreviewPricing: ModelDescriptionSchema['chatPrice'] = {
   input: [{ upTo: 200000, price: 1.25 }, { upTo: null, price: 2.50 }],
@@ -72,6 +74,21 @@ const gemini25FlashPreviewNonThinkingPricing: ModelDescriptionSchema['chatPrice'
 const gemini25FlashPreviewThinkingPricing: ModelDescriptionSchema['chatPrice'] = {
   input: 0.15, // text/image/video; audio is $1.00 but we don't differentiate yet
   output: 3.50, // thinking
+};
+
+const gemini25FlashNativeAudioPricing: ModelDescriptionSchema['chatPrice'] = {
+  input: 0.50, // text; audio/video is $3.00 but we don't differentiate yet
+  output: 2.00, // text; audio is $12.00 but we don't differentiate yet
+};
+
+const gemini25FlashPreviewTTSPricing: ModelDescriptionSchema['chatPrice'] = {
+  input: 0.50, // text input
+  // output: 10.00, // not ready for audio output yet, as of 2025-05-27
+};
+
+const gemini25ProPreviewTTSPricing: ModelDescriptionSchema['chatPrice'] = {
+  input: 1.00, // text input
+  // output: 20.00, // not ready for audio output yet, as of 2025-05-27
 };
 
 const gemini20FlashPricing: ModelDescriptionSchema['chatPrice'] = {
@@ -149,18 +166,41 @@ const _knownGeminiModels: ({
     interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
     // parameterSpecs: [{ paramId: 'llmVndGeminiShowThoughts' }], // Gemini doesn't show thoughts anymore
     benchmark: { cbaElo: 1437 /* +1 because free */ },
-    hidden: true, //
+    hidden: true, // seems to be discouraged - still available, but cannot rely on it
+  },
+
+  // 2.5 Pro Preview TTS
+  {
+    id: 'models/gemini-2.5-pro-preview-tts',
+    isPreview: true,
+    chatPrice: gemini25ProPreviewTTSPricing,
+    interfaces: [
+      LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json,
+      LLM_IF_Outputs_Audio, LLM_IF_Outputs_NoText,
+      LLM_IF_HOTFIX_StripSys0, // TTS: no system instruction
+      LLM_IF_HOTFIX_NoStream, // TTS: no streaming - use generateContent instead
+    ],
+    benchmark: undefined, // TTS models are not benchmarkable
+    hidden: true, // audio outputs are unavailable as of 2025-05-27
   },
 
   // 2.5 Flash Preview
   {
+    id: 'models/gemini-2.5-flash-preview-05-20',
+    isPreview: true,
+    chatPrice: gemini25FlashPreviewThinkingPricing,
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
+    parameterSpecs: [{ paramId: 'llmVndGeminiThinkingBudget' }],
+    benchmark: { cbaElo: 1424 },
+  },
+  {
     id: 'models/gemini-2.5-flash-preview-04-17',
-    // labelOverride: 'Gemini 2.5 Flash Preview 04-17',
     isPreview: true,
     chatPrice: gemini25FlashPreviewThinkingPricing,
     interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
     parameterSpecs: [{ paramId: 'llmVndGeminiThinkingBudget' }],
     benchmark: { cbaElo: 1392 },
+    hidden: true, // Hidden now that 05-20 is available
   },
   {
     id: 'models/gemini-2.5-flash-preview-04-17-thinking',
@@ -170,6 +210,39 @@ const _knownGeminiModels: ({
     interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
     parameterSpecs: [{ paramId: 'llmVndGeminiThinkingBudget' }],
     hidden: true,
+  },
+
+  // 2.5 Flash Preview TTS
+  {
+    id: 'models/gemini-2.5-flash-preview-tts',
+    isPreview: true,
+    chatPrice: gemini25FlashPreviewTTSPricing,
+    interfaces: [
+      LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json,
+      LLM_IF_Outputs_Audio, LLM_IF_Outputs_NoText,
+      LLM_IF_HOTFIX_StripSys0, // TTS: no system instruction
+      LLM_IF_HOTFIX_NoStream, // TTS: no streaming - use generateContent instead
+    ],
+    benchmark: undefined, // TTS models are not benchmarkable
+    hidden: true, // audio outputs are unavailable as of 2025-05-27
+  },
+
+  // 2.5 Flash Native Audio (Dialog and Thinking variants)
+  {
+    id: 'models/gemini-2.5-flash-preview-native-audio-dialog',
+    isPreview: true,
+    chatPrice: gemini25FlashNativeAudioPricing,
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_Outputs_Audio],
+    benchmark: undefined, // Native audio models are not benchmarkable
+    _delete: true, // dialog models unsupported as of 2025-05-27, but keeping the model for now
+  },
+  {
+    id: 'models/gemini-2.5-flash-exp-native-audio-thinking-dialog',
+    isPreview: true,
+    chatPrice: gemini25FlashNativeAudioPricing,
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, LLM_IF_OAI_Reasoning, LLM_IF_Outputs_Audio],
+    benchmark: undefined, // Native audio models are not benchmarkable
+    _delete: true, // dialog models unsupported as of 2025-05-27, but keeping the model for now
   },
 
 
@@ -438,6 +511,14 @@ const _knownGeminiModels: ({
 
   /// Other Experimental Models
 
+  // Gemma 3n Model (newer than 3, first seen on the May 2025 update)
+  {
+    id: 'models/gemma-3n-e4b-it',
+    isPreview: true,
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_HOTFIX_StripImages, LLM_IF_HOTFIX_Sys0ToUsr0],
+    chatPrice: geminiExpFree, // Free tier only according to pricing page
+    benchmark: { cbaElo: 1275 }, // Estimating based on comparable models
+  },
   // Gemma 3 Experimental Models - note: we apply workarounds:
   // - LLM_IF_HOTFIX_StripImages, because: "Image input modality is not enabled for models/gemma-3-27b-it"
   // - LLM_IF_HOTFIX_Sys0ToUsr0, because: "Developer instruction is not enabled for models/gemma-3-27b-it"
@@ -476,14 +557,6 @@ const _knownGeminiModels: ({
   // LearnLM Experimental Model
   {
     id: 'models/learnlm-2.0-flash-experimental',
-    isPreview: true,
-    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision],
-    chatPrice: geminiExpFree,
-    // hidden: true,
-    // _delete: true,
-  },
-  {
-    id: 'models/learnlm-1.5-pro-experimental',
     isPreview: true,
     interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision],
     chatPrice: geminiExpFree,
@@ -533,11 +606,40 @@ export function geminiDevCheckForSuperfluousModels_DEV(apiModelIds: string[]): v
 }
 
 
+/**
+ * Checks if Gemini has updated the API.
+
+ * Compares wireModels with parsedModels for missing or mismatched parsed data.
+ * @param wireModels is the raw API response from Gemini, containing the .models[] array
+ * @param parsedModels is the parsed models array, which should match the wireModels
+ */
+export function geminiDevCheckForParserMisses_DEV(wireModels: unknown, parsedModels: object[]): void {
+
+  if (DEV_DEBUG_GEMINI_MODELS) {
+
+    // ensure wireModels has .models array
+    if (!wireModels || !Array.isArray((wireModels as any)?.models)) {
+      console.warn('[DEV] Gemini: wireModels.models is not an array', wireModels);
+      return;
+    }
+
+    // find differences between wireModels and parsedModels using JSON.stringify
+    const wireModelsJson = JSON.stringify((wireModels as any).models);
+    const parsedModelsJson = JSON.stringify(parsedModels);
+    if (wireModelsJson !== parsedModelsJson)
+      console.warn('[DEV] Gemini: wireModels and parsedModels do not match!', wireModelsJson, parsedModelsJson);
+
+  }
+
+}
+
+
 export function geminiFilterModels(geminiModel: GeminiWire_API_Models_List.Model): boolean {
   const isAllowed = !filterUnallowedNames.some(name => geminiModel.displayName.includes(name));
-  const isSupported = !filterUnallowedInterfaces.some(iface => geminiModel.supportedGenerationMethods.includes(iface));
+  // const isSupported = !filterUnallowedInterfaces.some(iface => geminiModel.supportedGenerationMethods.includes(iface));
+  const isChatSupported = geminiModel.supportedGenerationMethods.some(iface => geminiChatInterfaces.includes(iface));
   const isWhatItSaysItIs = !filterLyingModelNames.includes(geminiModel.name);
-  return isAllowed && isSupported && isWhatItSaysItIs;
+  return isAllowed && isChatSupported && isWhatItSaysItIs;
 }
 
 
@@ -562,6 +664,7 @@ const _sortOderIdPrefix: string[] = [
   'models/gemini-1.5-flash-8b',
   'models/gemini-1.0-pro',
   'models/gemini-pro',
+  'models/gemma-3n-',
   'models/gemma-3-27b',
   'models/gemma-3-12b',
   'models/gemma-3-4b',
@@ -607,6 +710,15 @@ export function geminiModelToModelDescription(geminiModel: GeminiWire_API_Models
   // if (DEV_DEBUG_GEMINI_MODELS)
   //   console.log('geminiModelToModelDescription', geminiModel);
 
+  // handle unsupported interfaces
+  const hasChatInterfaces = supportedGenerationMethods.some(iface => geminiChatInterfaces.includes(iface));
+  if (!hasChatInterfaces) {
+    if (DEV_DEBUG_GEMINI_MODELS)
+      console.warn(`geminiModelToModelDescription: no chat interfaces (${supportedGenerationMethods.join(', ')}) for model ${modelId} (${displayName}) - skipping.`);
+    return null; // skip models without chat interfaces
+  }
+
+
   // find known manual mapping
   const knownModel = _knownGeminiModels.find(m => m.id === modelId);
   if (!knownModel && DEV_DEBUG_GEMINI_MODELS)
@@ -626,7 +738,6 @@ export function geminiModelToModelDescription(geminiModel: GeminiWire_API_Models
   //   label += ' (really: 1114)';
 
   // handle hidden models
-  const hasChatInterfaces = supportedGenerationMethods.some(iface => geminiChatInterfaces.includes(iface));
   const hidden = knownModel?.hidden || !!knownModel?.symLink || !hasChatInterfaces;
 
   // context window
@@ -666,6 +777,20 @@ export function geminiModelToModelDescription(geminiModel: GeminiWire_API_Models
 
 const hardcodedGeminiVariants: { [modelId: string]: Partial<ModelDescriptionSchema>[] } = {
 
+  // Adding non-thinking variant for the newest Gemini 2.5 Flash Preview 05-20 model
+  'models/gemini-2.5-flash-preview-05-20': [{
+    idVariant: '-non-thinking',
+    label: 'Gemini 2.5 Flash Preview (Non-thinking, 05-20)',
+    chatPrice: gemini25FlashPreviewNonThinkingPricing,
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Json, /*LLM_IF_OAI_Reasoning,*/ LLM_IF_GEM_CodeExecution],
+    parameterSpecs: [{
+      paramId: 'llmVndGeminiThinkingBudget',
+      hidden: true,
+      initialValue: 0, // non-thinking: we fix the thinking budget to 0
+    }],
+    hidden: true,
+  }],
+
   // Changes to the thinking variant (same model ID) for the Gemini 2.5 Flash Preview model
   'models/gemini-2.5-flash-preview-04-17': [{
     idVariant: '-non-thinking',
@@ -683,7 +808,7 @@ const hardcodedGeminiVariants: { [modelId: string]: Partial<ModelDescriptionSche
 } as const;
 
 export function geminiModelsAddVariants(models: ModelDescriptionSchema[]): ModelDescriptionSchema[] {
-  return models.reduce((acc, model, idx) => {
+  return models.reduce((acc, model) => {
 
     // insert the model in the same order
     acc.push(model);
