@@ -36,7 +36,8 @@ export function createOpenAIChatCompletionsChunkParser(): ChatGenerateParseFunct
   let hasWarned = false;
   let timeToFirstEvent: number | undefined;
   let progressiveCitationNumber = 1;
-  let perplexityAlreadyCited = false;
+  // let perplexityAlreadyCited = false;
+  let processedSearchResultUrls = new Set<string>();
   // NOTE: could compute rate (tok/s) from the first textful event to the last (to ignore the prefill time)
 
   // Supporting structure to accumulate the assistant message
@@ -65,9 +66,16 @@ export function createOpenAIChatCompletionsChunkParser(): ChatGenerateParseFunct
     // ```Can you extend the Zod chunk response object parsing (all optional) to include the missing data? The following is an exampel of the object I received:```
     const chunkData = JSON.parse(eventData); // this is here just for ease of breakpoint, otherwise it could be inlined
 
-    // [OpenRouter] transmits upstream errors pre-parsing (object wouldn't be valid)
+    // [OpenRouter/others] transmits upstream errors pre-parsing (object wouldn't be valid)
     if (_forwardOpenRouterDataError(chunkData, pt))
       return;
+
+    // [OpenAI] Obfuscation message with no data -> skip
+    if (!chunkData?.['choices'] && chunkData?.['obfuscation']) {
+      // NOTE: these sort of messages have no useful data and would break the parser here
+      // console.log('AIX: OpenAI-dispatch: missing-choices chunk skipped', chunkData);
+      return;
+    }
 
     const json = OpenAIWire_API_Chat_Completions.ChunkResponse_schema.parse(chunkData);
 
@@ -123,6 +131,44 @@ export function createOpenAIChatCompletionsChunkParser(): ChatGenerateParseFunct
     // expect: 1 completion, or stop
     if (json.choices.length !== 1)
       throw new Error(`expected 1 completion, got ${json.choices.length}`);
+
+
+    // [Perplexity] .search_results
+    if (json.search_results && Array.isArray(json.search_results)) {
+
+      // Process only new search results
+      for (const searchResult of json.search_results) {
+
+        // Incremental processing
+        const url = searchResult?.url;
+        if (!url || processedSearchResultUrls.has(url))
+          continue;
+        processedSearchResultUrls.add(url);
+
+        // Append the new citation
+        let pubTs: number | undefined;
+        if (searchResult.date) {
+          const date = new Date(searchResult.date);
+          if (!isNaN(date.getTime()))
+            pubTs = date.getTime();
+        }
+        pt.appendUrlCitation(searchResult.title || '', url, progressiveCitationNumber++, undefined, undefined, undefined, pubTs);
+      }
+
+    }
+    // [Perplexity] .citations (DEPRECATED)
+    // if (json.citations && !perplexityAlreadyCited && Array.isArray(json.citations)) {
+    //
+    //   for (const citationUrl of json.citations)
+    //     if (typeof citationUrl === 'string')
+    //       pt.appendUrlCitation('', citationUrl, progressiveCitationNumber++, undefined, undefined, undefined);
+    //
+    //   // Perplexity detection: streaming of full objects, hence we don't re-send the citations at every chunk
+    //   if (json.object === 'chat.completion')
+    //     perplexityAlreadyCited = true;
+    //
+    // }
+
 
     for (const { index, delta, finish_reason } of json.choices) {
 
@@ -209,7 +255,7 @@ export function createOpenAIChatCompletionsChunkParser(): ChatGenerateParseFunct
           for (const { type: annotationType, url_citation: urlCitation } of delta.annotations) {
             if (annotationType !== 'url_citation')
               throw new Error(`unexpected annotation type: ${annotationType}`);
-            pt.appendUrlCitation(urlCitation.title, urlCitation.url, undefined, urlCitation.start_index, urlCitation.end_index, undefined);
+            pt.appendUrlCitation(urlCitation.title, urlCitation.url, undefined, urlCitation.start_index, urlCitation.end_index, undefined, undefined);
           }
         } else {
           // we don't abort for this issue - for our users
@@ -231,20 +277,6 @@ export function createOpenAIChatCompletionsChunkParser(): ChatGenerateParseFunct
 
     } // .choices[]
 
-
-    // [Perplexity] .citations
-    if (json.citations && !perplexityAlreadyCited && Array.isArray(json.citations)) {
-
-      for (const citationUrl of json.citations)
-        if (typeof citationUrl === 'string')
-          pt.appendUrlCitation('', citationUrl, progressiveCitationNumber++, undefined, undefined, undefined);
-
-      // Perplexity detection: streaming of full objects, hence we don't re-send the citations at every chunk
-      if (json.object === 'chat.completion')
-        perplexityAlreadyCited = true;
-
-    }
-
   };
 }
 
@@ -260,7 +292,7 @@ export function createOpenAIChatCompletionsParserNS(): ChatGenerateParseFunction
     // Throws on malformed event data
     const completeData = JSON.parse(eventData);
 
-    // [OpenRouter] transmits upstream errors pre-parsing (object wouldn't be valid)
+    // [OpenRouter/others] transmits upstream errors pre-parsing (object wouldn't be valid)
     if (_forwardOpenRouterDataError(completeData, pt))
       return;
 
@@ -305,6 +337,10 @@ export function createOpenAIChatCompletionsParserNS(): ChatGenerateParseFunction
       } else if (message.content !== undefined && message.content !== null)
         throw new Error(`unexpected message content type: ${typeof message.content}`);
 
+      // [OpenRouter, 2025-06-05] Handle reasoning field from OpenRouter
+      if (typeof message.reasoning === 'string')
+        pt.appendReasoningText(message.reasoning);
+
       // message: Tool Calls
       for (const toolCall of (message.tool_calls || [])) {
 
@@ -330,7 +366,7 @@ export function createOpenAIChatCompletionsParserNS(): ChatGenerateParseFunction
           for (const { type: annotationType, url_citation: urlCitation } of message.annotations) {
             if (annotationType !== 'url_citation')
               throw new Error(`unexpected annotation type: ${annotationType}`);
-            pt.appendUrlCitation(urlCitation.title, urlCitation.url, undefined, urlCitation.start_index, urlCitation.end_index, undefined);
+            pt.appendUrlCitation(urlCitation.title, urlCitation.url, undefined, urlCitation.start_index, urlCitation.end_index, undefined, undefined);
           }
         } else {
           // we don't abort for this issue
@@ -341,14 +377,32 @@ export function createOpenAIChatCompletionsParserNS(): ChatGenerateParseFunction
 
     } // .choices[]
 
-    // [Perplexity] .citations
-    if (json.citations && Array.isArray(json.citations)) {
+    // [Perplexity] .search_results
+    if (json.search_results && Array.isArray(json.search_results)) {
 
-      for (const citationUrl of json.citations)
-        if (typeof citationUrl === 'string')
-          pt.appendUrlCitation('', citationUrl, progressiveCitationNumber++, undefined, undefined, undefined);
+      for (const searchResult of json.search_results) {
+        const url = searchResult?.url;
+        if (url) {
+          // Append the new citation
+          let pubTs: number | undefined;
+          if (searchResult.date) {
+            const date = new Date(searchResult.date);
+            if (!isNaN(date.getTime()))
+              pubTs = date.getTime();
+          }
+          pt.appendUrlCitation(searchResult.title || '', url, progressiveCitationNumber++, undefined, undefined, undefined, pubTs);
+        }
+      }
 
     }
+    // [Perplexity] .citations (DEPRECATED)
+    // if (json.citations && Array.isArray(json.citations)) {
+    //
+    //   for (const citationUrl of json.citations)
+    //     if (typeof citationUrl === 'string')
+    //       pt.appendUrlCitation('', citationUrl, progressiveCitationNumber++, undefined, undefined, undefined);
+    //
+    // }
 
   };
 }

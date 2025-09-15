@@ -1,8 +1,10 @@
+import { TRPCClientError } from '@trpc/client';
+
 import { findServiceAccessOrThrow } from '~/modules/llms/vendors/vendor.helpers';
 
 import type { DMessage, DMessageGenerator } from '~/common/stores/chat/chat.message';
 import type { MaybePromise } from '~/common/types/useful.types';
-import { DLLM, DLLMId, LLM_IF_HOTFIX_NoTemperature, LLM_IF_Outputs_Audio, LLM_IF_Outputs_Image, LLM_IF_Outputs_NoText } from '~/common/stores/llms/llms.types';
+import { DLLM, DLLMId, LLM_IF_HOTFIX_NoTemperature, LLM_IF_OAI_Responses, LLM_IF_Outputs_Audio, LLM_IF_Outputs_Image, LLM_IF_Outputs_NoText } from '~/common/stores/llms/llms.types';
 import { apiStream } from '~/common/util/trpc.client';
 import { DMetricsChatGenerate_Lg, metricsChatGenerateLgToMd, metricsComputeChatGenerateCostsMd } from '~/common/stores/metrics/metrics.chatgenerate';
 import { DModelParameterValues, getAllModelParameterValues } from '~/common/stores/llms/llms.parameters';
@@ -32,25 +34,28 @@ export function aixCreateChatGenerateContext(name: AixAPI_Context_ChatGenerate['
 
 export function aixCreateModelFromLLMOptions(
   llmInterfaces: DLLM['interfaces'],
-  llmOptions: DModelParameterValues,
-  _llmOptionsOverride: Omit<DModelParameterValues, 'llmRef'> | undefined,
+  llmOptions: DModelParameterValues, // this must have been already externally computed, usually as the initial values + user/over replacements
+  llmOptionOverrides: Omit<DModelParameterValues, 'llmRef'> | undefined,
   debugLlmId: string,
 ): AixAPI_Model {
 
   // make sure llmRef is removed, if present in the override - excess of caution here
-  const llmOptionsOverride = _llmOptionsOverride ? { ..._llmOptionsOverride } : undefined;
-  if (llmOptionsOverride)
-    delete (llmOptionsOverride as { llmRef?: any }).llmRef;
+  if (llmOptionOverrides) {
+    llmOptionOverrides = { ...llmOptionOverrides };
+    delete (llmOptionOverrides as { llmRef?: any }).llmRef;
+  }
 
   // destructure input with the overrides
   const {
     llmRef, llmTemperature, llmResponseTokens, llmTopP, llmForceNoStream,
     llmVndAntThinkingBudget,
     llmVndGeminiShowThoughts, llmVndGeminiThinkingBudget,
-    llmVndOaiReasoningEffort, llmVndOaiRestoreMarkdown, llmVndOaiWebSearchContext, llmVndOaiWebSearchGeolocation,
+    llmVndOaiReasoningEffort, llmVndOaiReasoningEffort4, llmVndOaiRestoreMarkdown, llmVndOaiVerbosity, llmVndOaiWebSearchContext, llmVndOaiWebSearchGeolocation,
+    llmVndPerplexityDateFilter, llmVndPerplexitySearchMode,
+    llmVndXaiSearchMode, llmVndXaiSearchSources, llmVndXaiSearchDateFilter,
   } = {
     ...llmOptions,
-    ...llmOptionsOverride,
+    ...llmOptionOverrides,
   };
 
   // llmRef is absolutely required
@@ -66,6 +71,9 @@ export function aixCreateModelFromLLMOptions(
   if (!llmInterfaces.includes(LLM_IF_Outputs_NoText)) acceptsOutputs.push('text');
   if (llmInterfaces.includes(LLM_IF_Outputs_Audio)) acceptsOutputs.push('audio');
   if (llmInterfaces.includes(LLM_IF_Outputs_Image)) acceptsOutputs.push('image');
+
+  // Output APIs
+  const llmVndOaiResponsesAPI = llmInterfaces.includes(LLM_IF_OAI_Responses);
 
   // Client-side late stage model HotFixes
   const hotfixOmitTemperature = llmInterfaces.includes(LLM_IF_HOTFIX_NoTemperature);
@@ -95,10 +103,17 @@ export function aixCreateModelFromLLMOptions(
     ...(llmVndAntThinkingBudget !== undefined ? { vndAntThinkingBudget: llmVndAntThinkingBudget } : {}),
     ...(llmVndGeminiShowThoughts ? { vndGeminiShowThoughts: llmVndGeminiShowThoughts } : {}),
     ...(llmVndGeminiThinkingBudget !== undefined ? { vndGeminiThinkingBudget: llmVndGeminiThinkingBudget } : {}),
-    ...(llmVndOaiReasoningEffort ? { vndOaiReasoningEffort: llmVndOaiReasoningEffort } : {}),
+    ...(llmVndOaiResponsesAPI ? { vndOaiResponsesAPI: true } : {}),
+    ...((llmVndOaiReasoningEffort4 || llmVndOaiReasoningEffort) ? { vndOaiReasoningEffort: llmVndOaiReasoningEffort4 || llmVndOaiReasoningEffort } : {}),
     ...(llmVndOaiRestoreMarkdown ? { vndOaiRestoreMarkdown: llmVndOaiRestoreMarkdown } : {}),
+    ...(llmVndOaiVerbosity ? { vndOaiVerbosity: llmVndOaiVerbosity } : {}),
     ...(llmVndOaiWebSearchContext ? { vndOaiWebSearchContext: llmVndOaiWebSearchContext } : {}),
+    ...(llmVndPerplexityDateFilter ? { vndPerplexityDateFilter: llmVndPerplexityDateFilter } : {}),
+    ...(llmVndPerplexitySearchMode ? { vndPerplexitySearchMode: llmVndPerplexitySearchMode } : {}),
     ...(userGeolocation ? { userGeolocation } : {}),
+    ...(llmVndXaiSearchMode ? { vndXaiSearchMode: llmVndXaiSearchMode } : {}),
+    ...(llmVndXaiSearchSources ? { vndXaiSearchSources: llmVndXaiSearchSources } : {}),
+    ...(llmVndXaiSearchDateFilter ? { vndXaiSearchDateFilter: llmVndXaiSearchDateFilter } : {}),
   };
 }
 
@@ -123,7 +138,10 @@ type StreamMessageStatus = {
 interface AixClientOptions {
   abortSignal: AbortSignal | 'NON_ABORTABLE'; // 'NON_ABORTABLE' is a special case for non-abortable operations
   throttleParallelThreads?: number; // 0: disable, 1: default throttle (12Hz), 2+ reduce frequency with the square root
-  llmOptionsOverride?: Omit<DModelParameterValues, 'llmRef'>; // overrides for the LLM options
+
+  // LLM parameter configuration layers: full replacement of user params and/or overrides of a set of individual params
+  llmUserParametersReplacement?: DModelParameterValues; // can replace the 'global' llm user configuration with an alternate config (e.g. persona, or per-chat)
+  llmOptionsOverride?: Omit<DModelParameterValues, 'llmRef'>; // overrides (sets/replaces) individual LLM parameters
 }
 
 
@@ -242,7 +260,7 @@ export async function aixChatGenerateText_Simple(
   const { transportAccess: aixAccess, vendor: llmVendor, serviceSettings: llmServiceSettings } = findServiceAccessOrThrow<object, AixAPI_Access>(llm.sId);
 
   // Aix Model
-  const llmParameters = getAllModelParameterValues(llm.initialParameters, llm.userParameters);
+  const llmParameters = getAllModelParameterValues(llm.initialParameters, clientOptions?.llmUserParametersReplacement ?? llm.userParameters);
   const aixModel = aixCreateModelFromLLMOptions(llm.interfaces, llmParameters, clientOptions?.llmOptionsOverride, llmId);
 
   // Aix ChatGenerate Request
@@ -354,7 +372,8 @@ function _llToText(src: AixChatGenerateContent_LL, dest: AixChatGenerateText_Sim
   if (src.fragments.length) {
     dest.text = '';
     for (let fragment of src.fragments) {
-      switch (fragment.part.pt) {
+      const pt = fragment.part.pt;
+      switch (pt) {
         case 'text':
           dest.text += fragment.part.text;
           break;
@@ -363,10 +382,16 @@ function _llToText(src: AixChatGenerateContent_LL, dest: AixChatGenerateText_Sim
           break;
         case 'tool_invocation':
           throw new Error(`AIX: Unexpected tool invocation ${fragment.part.invocation?.type === 'function_call' ? fragment.part.invocation.name : fragment.part.id} in the Text response.`);
+        case 'annotations': // citations - ignored
+        case 'ma': // model annotations (thinking tokens) - ignored
+        case 'ph': // placeholder - ignored
+        case 'reference': // impossible
         case 'image_ref': // impossible
-        case 'tool_response': // impossible - stopped at the invocation alrady
+        case 'tool_response': // impossible - stopped at the invocation already
         case '_pt_sentinel': // impossible
           break;
+        default:
+          const _exhaustiveCheck: never = pt;
       }
     }
   }
@@ -416,7 +441,7 @@ export async function aixChatGenerateContent_DMessage<TServiceSettings extends o
   const { transportAccess: aixAccess, vendor: llmVendor, serviceSettings: llmServiceSettings } = findServiceAccessOrThrow<TServiceSettings, TAccess>(llm.sId);
 
   // Aix Model
-  const llmParameters = getAllModelParameterValues(llm.initialParameters, llm.userParameters);
+  const llmParameters = getAllModelParameterValues(llm.initialParameters, clientOptions?.llmUserParametersReplacement ?? llm.userParameters);
   const aixModel = aixCreateModelFromLLMOptions(llm.interfaces, llmParameters, clientOptions?.llmOptionsOverride, llmId);
 
   // Client-side late stage model HotFixes
@@ -498,8 +523,8 @@ function _llToDMessage(src: AixChatGenerateContent_LL, dest: AixChatGenerateCont
 
 function _updateGeneratorCostsInPlace(generator: DMessageGenerator, llm: DLLM, debugCostSource: string) {
   // Compute costs
-  const llmParameters = getAllModelParameterValues(llm.initialParameters, llm.userParameters);
-  const costs = metricsComputeChatGenerateCostsMd(generator.metrics, llm.pricing?.chat, llmParameters.llmRef || llm.id);
+  const logLlmRefId = getAllModelParameterValues(llm.initialParameters, llm.userParameters).llmRef || llm.id;
+  const costs = metricsComputeChatGenerateCostsMd(generator.metrics, llm.pricing?.chat, logLlmRefId);
   if (!costs) {
     // FIXME: we shall warn that the costs are missing, as the only way to get pricing is through surfacing missing prices
     return;
@@ -587,7 +612,7 @@ async function _aixChatGenerateContent_LL(
     /* rest start as undefined (missing in reality) */
   };
 
-  const sendContentUpdate = !onGenerateContentUpdate ? undefined : withDecimator(throttleParallelThreads ?? 0, async () => {
+  const sendContentUpdate = !onGenerateContentUpdate ? undefined : withDecimator(throttleParallelThreads ?? 0, 'aicChatGenerateContent', async () => {
     /**
      * We want the first update to have actual content.
      * However note that we won't be sending out the model name very fast this way,
@@ -661,10 +686,16 @@ async function _aixChatGenerateContent_LL(
     for await (const particle of particles)
       reassembler.enqueueWireParticle(particle);
 
+    // dispose the deadline decimator before the await, as we're done basically
+    sendContentUpdate?.dispose?.();
+
     // synchronize any pending async tasks
     await reassembler.waitForWireComplete();
 
   } catch (error: any) {
+
+    // dispose the deadline decimator, as we're into error handling mode now
+    sendContentUpdate?.dispose?.();
 
     // something else broke, likely a User Abort, or an Aix server error (e.g. tRPC)
     const isUserAbort = abortSignal.aborted;
@@ -677,10 +708,39 @@ async function _aixChatGenerateContent_LL(
     } else {
       // NOTE: this code path has also been almost replicated on `ContentReassembler.#processWireBacklog.catch() {...}`
       if (AIX_CLIENT_DEV_ASSERTS)
-        console.error('[DEV] Aix streaming Error:', error);
-      const showAsBold = !!accumulator_LL.fragments.length;
-      const errorText = (presentErrorToHumans(error, showAsBold, true) || 'Unknown error').replace('[TRPCClientError]', '');
-      await reassembler.setClientExcepted(`An unexpected error occurred: ${errorText} Please retry.`).catch(console.error /* never */);
+        console.error('[DEV] Aix streaming Error:', { error });
+
+      // Special case: request too large: this is a TRPCClientError, and we can show a user-friendly message
+      let errorHandled = false;
+      if (error instanceof TRPCClientError) {
+        switch (error.cause?.message) {
+          /**
+           * The body of the response was "Request Entity Too Large".
+           * - this caused trpc, in ...stream/jsonl.ts, function createConsumerStream, to throw an error due to parsing the line as JSON
+           *   - "const head = JSON.parse(line);"
+           * - as the error bubbles up to here, and cannot be handled by the superjson transformer either, which happens after this
+           */
+          case `Unexpected token 'R', "Request En"... is not valid JSON`:
+            await reassembler.setClientExcepted(`**Request too large**: Your message or attachments exceed the 4.5MB limit of the Vercel edge network. Tip: use the cleanup button in the right pane to hide messages, remove large attachments or reduce conversation length.`).catch(console.error);
+            errorHandled = true;
+            break;
+
+          /**
+           * This happened many times in the past with captive portals and alike. Jet's just improve the messaging here.
+           */
+          case `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`:
+            await reassembler.setClientExcepted(`**Connection issue**: The network returned an HTML page instead of expected data. This can be a Wi‑Fi sign‑in page, a proxy or browser extension, or a temporary gateway error. Please **refresh and try again**, or check your connection and disable blockers. Additional details may be available in the browser console.`).catch(console.error);
+            errorHandled = true;
+            break;
+        }
+      }
+
+      // Only show the generic error if we haven't handled it specifically
+      if (!errorHandled) {
+        const showAsBold = !!accumulator_LL.fragments.length;
+        const errorText = (presentErrorToHumans(error, showAsBold, true) || 'Unknown error').replace('[TRPCClientError]', '');
+        await reassembler.setClientExcepted(`An unexpected error occurred: ${errorText} Please retry.`).catch(console.error /* never */);
+      }
     }
 
   }
@@ -688,7 +748,7 @@ async function _aixChatGenerateContent_LL(
   // and we're done
   reassembler.finalizeAccumulator();
 
-  // final update (could ignore and take the final accumulator)
+  // final update bypasses decimation entirely and contains complete content
   await onGenerateContentUpdate?.(accumulator_LL, true /* Last message, done */);
 
   // return the final accumulated message

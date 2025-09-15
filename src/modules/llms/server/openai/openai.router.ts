@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from 'zod/v4';
 import { TRPCError } from '@trpc/server';
 
 import { createTRPCRouter, publicProcedure } from '~/server/trpc/trpc.server';
@@ -13,22 +13,22 @@ import { Brand } from '~/common/app.config';
 
 import { OpenAIWire_API_Images_Generations, OpenAIWire_API_Models_List, OpenAIWire_API_Moderations_Create } from '~/modules/aix/server/dispatch/wiretypes/openai.wiretypes';
 
-import { ListModelsResponse_schema, ModelDescriptionSchema } from '../llm.server.types';
+import { ListModelsResponse_schema, ModelDescriptionSchema, RequestAccessValues } from '../llm.server.types';
 import { alibabaModelSort, alibabaModelToModelDescription } from './models/alibaba.models';
-import { azureDeploymentFilter, azureDeploymentToModelDescription, azureParseFromDeploymentsAPI } from './models/azure.models';
+import { azureDeploymentFilter, azureDeploymentToModelDescription, azureOpenAIAccess, azureParseFromDeploymentsAPI } from './models/azure.models';
 import { chutesAIHeuristic, chutesAIModelsToModelDescriptions } from './models/chutesai.models';
 import { deepseekModelFilter, deepseekModelSort, deepseekModelToModelDescription } from './models/deepseek.models';
 import { fastAPIHeuristic, fastAPIModels } from './models/fastapi.models';
 import { fireworksAIHeuristic, fireworksAIModelsToModelDescriptions } from './models/fireworksai.models';
 import { groqModelFilter, groqModelSortFn, groqModelToModelDescription } from './models/groq.models';
 import { lmStudioModelToModelDescription, localAIModelSortFn, localAIModelToModelDescription } from './models/models.data';
-import { mistralModelsSort, mistralModelToModelDescription } from './models/mistral.models';
-import { openAIModelFilter, openAIModelToModelDescription, openAISortModels } from './models/openai.models';
+import { mistralModels } from './models/mistral.models';
+import { openAIModelFilter, openAIModelToModelDescription, openaiDevCheckForModelsOverlap_DEV, openAISortModels } from './models/openai.models';
 import { openPipeModelDescriptions, openPipeModelSort, openPipeModelToModelDescriptions } from './models/openpipe.models';
-import { openRouterModelFamilySortFn, openRouterModelToModelDescription } from './models/openrouter.models';
-import { perplexityAIModelDescriptions, perplexityAIModelSort } from './models/perplexity.models';
+import { openRouterInjectVariants, openRouterModelFamilySortFn, openRouterModelToModelDescription } from './models/openrouter.models';
+import { perplexityAIModelDescriptions, perplexityInjectVariants } from './models/perplexity.models';
 import { togetherAIModelsToModelDescriptions } from './models/together.models';
-import { wilreLocalAIModelsApplyOutputSchema, wireLocalAIModelsAvailableOutputSchema, wireLocalAIModelsListOutputSchema } from './localai.wiretypes';
+import { wireLocalAIModelsApplyOutputSchema, wireLocalAIModelsAvailableOutputSchema, wireLocalAIModelsListOutputSchema } from './localai.wiretypes';
 import { xaiModelDescriptions, xaiModelSort } from './models/xai.models';
 
 
@@ -40,7 +40,7 @@ export type OpenAIDialects = z.infer<typeof openAIDialects>;
 export const openAIAccessSchema = z.object({
   dialect: openAIDialects,
   oaiKey: z.string().trim(),
-  oaiOrg: z.string().trim(), // [OpenPipe] we have a hack here, where we put the tags stringinfied JSON in here - cleanup in the future
+  oaiOrg: z.string().trim(), // [OpenPipe] we have a hack here, where we put the tags stringified JSON in here - cleanup in the future
   oaiHost: z.string().trim(),
   heliKey: z.string().trim(),
   moderationCheck: z.boolean(),
@@ -65,6 +65,8 @@ export type OpenAIAccessSchema = z.infer<typeof openAIAccessSchema>;
 
 /** Add https if missing, and remove trailing slash if present and the path starts with a slash. */
 export function fixupHost(host: string, apiPath: string): string {
+  if (!host)
+    return '';
   if (!host.startsWith('http'))
     host = `https://${host}`;
   if (host.endsWith('/') && apiPath.startsWith('/'))
@@ -161,20 +163,12 @@ export const llmOpenAIRouter = createTRPCRouter({
 
       let models: ModelDescriptionSchema[];
 
-      // [Azure]: use an older 'deployments' API to enumerate the models, and a modified OpenAI id to description mapping
-      if (access.dialect === 'azure') {
-        const azureOpenAIDeploymentsResponse = await openaiGETOrThrow(access, `/openai/deployments?api-version=2023-03-15-preview`);
-        const azureOpenAIDeployments = azureParseFromDeploymentsAPI(azureOpenAIDeploymentsResponse);
-        models = azureOpenAIDeployments
-          .filter(azureDeploymentFilter)
-          .map(azureDeploymentToModelDescription)
-          .sort(openAISortModels);
+      // [Perplexity]: there's no API for models listing (upstream: https://docs.perplexity.ai/guides/model-cards)
+      if (access.dialect === 'perplexity') {
+        models = perplexityAIModelDescriptions()
+          .reduce(perplexityInjectVariants, [] as ModelDescriptionSchema[]);
         return { models };
       }
-
-      // [Perplexity]: there's no API for models listing (upstream: https://docs.perplexity.ai/guides/model-cards)
-      if (access.dialect === 'perplexity')
-        return { models: perplexityAIModelDescriptions().sort(perplexityAIModelSort) };
 
       // [xAI]: custom models listing
       if (access.dialect === 'xai')
@@ -187,7 +181,7 @@ export const llmOpenAIRouter = createTRPCRouter({
       if (access.dialect === 'togetherai')
         return { models: togetherAIModelsToModelDescriptions(openAIWireModelsResponse) };
 
-      let openAIModels = openAIWireModelsResponse.data || [];
+      let openAIModels = openAIWireModelsResponse?.data || [];
 
       // de-duplicate by ids (can happen for local servers.. upstream bugs)
       const preCount = openAIModels.length;
@@ -205,6 +199,14 @@ export const llmOpenAIRouter = createTRPCRouter({
           models = openAIModels
             .map(({ id, created }) => alibabaModelToModelDescription(id, created))
             .sort(alibabaModelSort);
+          break;
+
+        case 'azure':
+          const azureOpenAIDeployments = azureParseFromDeploymentsAPI(openAIModels);
+          models = azureOpenAIDeployments
+            .filter(azureDeploymentFilter)
+            .map(azureDeploymentToModelDescription)
+            .sort(openAISortModels);
           break;
 
         case 'deepseek':
@@ -234,9 +236,7 @@ export const llmOpenAIRouter = createTRPCRouter({
           break;
 
         case 'mistral':
-          models = openAIModels
-            .map(mistralModelToModelDescription)
-            .sort(mistralModelsSort);
+          models = mistralModels(openAIModels);
           break;
 
         // [OpenAI]: chat-only models, custom sort, manual mapping
@@ -264,6 +264,9 @@ export const llmOpenAIRouter = createTRPCRouter({
 
             // custom OpenAI sort
             .sort(openAISortModels);
+
+          // [DEV] check for superfluous and missing models
+          openaiDevCheckForModelsOverlap_DEV(openAIWireModelsResponse, models);
           break;
 
         case 'openpipe':
@@ -278,7 +281,8 @@ export const llmOpenAIRouter = createTRPCRouter({
           models = openAIModels
             .sort(openRouterModelFamilySortFn)
             .map(openRouterModelToModelDescription)
-            .filter(desc => !!desc);
+            .filter(desc => !!desc)
+            .reduce(openRouterInjectVariants, [] as ModelDescriptionSchema[]);
           break;
 
       }
@@ -290,7 +294,7 @@ export const llmOpenAIRouter = createTRPCRouter({
   /* [OpenAI/LocalAI] images/generations */
   createImages: publicProcedure
     .input(createImagesInputSchema)
-    .mutation(async function* ({ input }): AsyncGenerator<T2ICreateImageAsyncStreamOp> {
+    .mutation(async function* ({ input, signal }): AsyncGenerator<T2ICreateImageAsyncStreamOp> {
 
       const { access, generationConfig: config, editConfig } = input;
 
@@ -374,8 +378,25 @@ export const llmOpenAIRouter = createTRPCRouter({
           config.model,  // modelRefId not really needed for these endpoints
           requestBody,
           isEdit ? '/v1/images/edits' : '/v1/images/generations',
-        ),
+          signal, // wire the signal from the input
+        )
+        .catch((error: any) => {
+          // if aborted, ignore the error, or else we'll throw an error
+          if (signal?.aborted)
+            return null; // de-facto ignores the error, and the connection is already gone
+
+          // otherwise, re-throw the error
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: `Error: ${error?.message || error?.toString() || 'Unknown error'}`,
+            cause: error,
+          });
+        }),
       );
+
+      // null: there was an error
+      if (!wireOpenAICreateImageOutput)
+        return null;
 
       // common image fields
       const [width, height] = (config.size as any) === 'auto'
@@ -454,7 +475,7 @@ export const llmOpenAIRouter = createTRPCRouter({
     .mutation(async ({ input: { access, galleryName, modelName } }) => {
       const galleryModelId = `${galleryName}@${modelName}`;
       const wireLocalAIModelApply = await openaiPOSTOrThrow(access, null, { id: galleryModelId }, '/models/apply');
-      return wilreLocalAIModelsApplyOutputSchema.parse(wireLocalAIModelApply);
+      return wireLocalAIModelsApplyOutputSchema.parse(wireLocalAIModelApply);
     }),
 
   /* [LocalAI] Poll for a Model download Job status */
@@ -505,7 +526,7 @@ function getRandomKeyFromMultiKey(multiKeyString: string): string {
   return multiKeys[Math.floor(Math.random() * multiKeys.length)];
 }
 
-export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | null, apiPath: string): { headers: HeadersInit, url: string } {
+export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | null, apiPath: string): RequestAccessValues {
   switch (access.dialect) {
 
     case 'alibaba':
@@ -527,29 +548,9 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
         url: alibabaOaiHost + apiPath,
       };
 
+
     case 'azure':
-      const azureKey = access.oaiKey || env.AZURE_OPENAI_API_KEY || '';
-      const azureHost = fixupHost(access.oaiHost || env.AZURE_OPENAI_API_ENDPOINT || '', apiPath);
-      if (!azureKey || !azureHost)
-        throw new Error('Missing Azure API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
-
-      let url = azureHost;
-      if (apiPath.startsWith('/v1/')) {
-        if (!modelRefId)
-          throw new Error('Azure OpenAI API needs a deployment id');
-        url += `/openai/deployments/${modelRefId}/${apiPath.replace('/v1/', '')}?api-version=2025-02-01-preview`;
-      } else if (apiPath.startsWith('/openai/deployments'))
-        url += apiPath;
-      else
-        throw new Error('Azure OpenAI API path not supported: ' + apiPath);
-
-      return {
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': azureKey,
-        },
-        url,
-      };
+      return azureOpenAIAccess(access, modelRefId, apiPath);
 
 
     case 'deepseek':
@@ -777,9 +778,9 @@ async function openaiGETOrThrow<TOut extends object>(access: OpenAIAccessSchema,
   return await fetchJsonOrTRPCThrow<TOut>({ url, headers, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}` });
 }
 
-async function openaiPOSTOrThrow<TOut extends object, TPostBody extends object | FormData>(access: OpenAIAccessSchema, modelRefId: string | null, body: TPostBody, apiPath: string /*, signal?: AbortSignal*/): Promise<TOut> {
+async function openaiPOSTOrThrow<TOut extends object, TPostBody extends object | FormData>(access: OpenAIAccessSchema, modelRefId: string | null, body: TPostBody, apiPath: string, signal: undefined | AbortSignal = undefined): Promise<TOut> {
   const { headers, url } = openAIAccess(access, modelRefId, apiPath);
-  return await fetchJsonOrTRPCThrow<TOut, TPostBody>({ url, method: 'POST', headers, body, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}` });
+  return await fetchJsonOrTRPCThrow<TOut, TPostBody>({ url, method: 'POST', headers, body, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}`, signal });
 }
 
 

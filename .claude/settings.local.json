@@ -3,9 +3,11 @@
     "allow": [
       "Bash(cat:*)",
       "Bash(cp:*)",
+      "Bash(find:*)",
       "Bash(git branch:*)",
       "Bash(grep:*)",
       "Bash(ls:*)",
+      "Bash(mkdir:*)",
       "Bash(node:*)",
       "Bash(npm install)",
       "Bash(npm install:*)",
@@ -14,7 +16,10 @@
       "Bash(rg:*)",
       "Bash(rm:*)",
       "Bash(sed:*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:big-agi.com)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "mcp__ide__getDiagnostics"
     ],
     "deny": [
       "Read(node_modules)",

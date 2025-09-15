@@ -10,6 +10,7 @@ import AlternateEmailIcon from '@mui/icons-material/AlternateEmail';
 import CheckRoundedIcon from '@mui/icons-material/CheckRounded';
 import CloseRoundedIcon from '@mui/icons-material/CloseRounded';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import ContentCutIcon from '@mui/icons-material/ContentCut';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import DifferenceIcon from '@mui/icons-material/Difference';
 import EditRoundedIcon from '@mui/icons-material/EditRounded';
@@ -121,6 +122,10 @@ const antCachePromptOnSx: SxProps = {
 };
 
 
+export interface ChatMessageFunctionsHandle {
+  beginEditTextContent: () => void;
+}
+
 export type ChatMessageTextPartEditState = { [fragmentId: DMessageFragmentId]: string };
 
 export const ChatMessageMemo = React.memo(ChatMessage);
@@ -134,6 +139,7 @@ export const ChatMessageMemo = React.memo(ChatMessage);
  *
  */
 export function ChatMessage(props: {
+  actionsRef?: React.Ref<ChatMessageFunctionsHandle>,
   message: DMessage,
   diffPreviousText?: string,
   fitScreen: boolean,
@@ -220,7 +226,7 @@ export function ChatMessage(props: {
   const handleHighlightSelText = useSelHighlighterMemo(messageId, selText, contentFragments, fromAssistant, props.onMessageFragmentReplace);
 
   const textSubject = selText ? selText : fragmentFlattenedText;
-  const isSpecialT2I = textSubject.startsWith('https://images.prodia.xyz/') || textSubject.startsWith('/draw ') || textSubject.startsWith('/imagine ') || textSubject.startsWith('/img ');
+  const isSpecialT2I = textSubject.startsWith('/draw ') || textSubject.startsWith('/imagine ') || textSubject.startsWith('/img ');
   const couldDiagram = textSubject.length >= 100 && !isSpecialT2I;
   const couldImagine = textSubject.length >= 3 && !isSpecialT2I;
   const couldSpeak = couldImagine;
@@ -527,6 +533,15 @@ export function ChatMessage(props: {
   }, [closeBubble]);
 
 
+  // Expose actions handle for parent components
+  React.useImperativeHandle(props.actionsRef, () => ({
+    beginEditTextContent: () => {
+      if (!isEditingText && props.onMessageFragmentReplace && !messagePendingIncomplete)
+        handleEditsBegin();
+    },
+  }), [handleEditsBegin, isEditingText, messagePendingIncomplete, props.onMessageFragmentReplace]);
+
+
   // Blocks renderer
 
   const handleBlocksContextMenu = React.useCallback((event: React.MouseEvent) => {
@@ -745,8 +760,8 @@ export function ChatMessage(props: {
             <InReferenceToList items={messageMetadata.inReferenceTo} />
           )}
 
-          {/* Image Attachment Fragments - just for a prettier display on top of the message */}
-          {imageAttachments.length >= 1 && (
+          {/* [NOT SYSTEM, UNREAL] Image Attachment Fragments - just for a prettier display on top of the message, but is "WRONG" logically as the text comes before the image */}
+          {!fromSystem && imageAttachments.length >= 1 && (
             <ImageAttachmentFragments
               imageAttachments={imageAttachments}
               contentScaling={adjContentScaling}
@@ -808,6 +823,17 @@ export function ChatMessage(props: {
               disableMarkdownText={disableMarkdown}
               onFragmentDelete={!props.onMessageFragmentDelete ? undefined : handleFragmentDelete}
               onFragmentReplace={!props.onMessageFragmentReplace ? undefined : handleFragmentReplace}
+            />
+          )}
+
+          {/* [SYSTEM, REAL] Image Attachment Fragments - just for a realistic display below the system instruction text/docs */}
+          {fromSystem && imageAttachments.length >= 1 && (
+            <ImageAttachmentFragments
+              imageAttachments={imageAttachments}
+              contentScaling={adjContentScaling}
+              messageRole={messageRole}
+              disabled={isEditingText}
+              onFragmentDelete={!props.onMessageFragmentDelete ? undefined : handleFragmentDelete}
             />
           )}
 
@@ -1087,6 +1113,14 @@ export function ChatMessage(props: {
                   closeBubble();
                 }}>
                   <FormatBoldIcon />
+                </IconButton>
+              </Tooltip>}
+              {fromAssistant && <Tooltip disableInteractive arrow placement='top' title='Cut Text'>
+                <IconButton disabled={!handleHighlightSelText} onClick={!handleHighlightSelText ? undefined : () => {
+                  handleHighlightSelText('cut');
+                  closeBubble();
+                }}>
+                  <ContentCutIcon />
                 </IconButton>
               </Tooltip>}
               {fromAssistant && <Divider />}

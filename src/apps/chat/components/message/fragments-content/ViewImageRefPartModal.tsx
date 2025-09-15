@@ -4,7 +4,7 @@ import type { SxProps } from '@mui/joy/styles/types';
 import { Box, Button } from '@mui/joy';
 import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined';
 
-import { getImageAsset } from '~/modules/dblobs/dblobs.images';
+import { getImageAsset } from '~/common/stores/blob/dblobs-portability';
 
 import type { DMessageImageRefPart } from '~/common/stores/chat/chat.fragments';
 import { GoodModal } from '~/common/components/modals/GoodModal';
@@ -89,7 +89,7 @@ export function ViewImageRefPartModal(props: {
     }
   }, [dataRef, altText]);
 
-  const title = props.imageRefPart.altText || 'Attachment Image';
+  const title = altText || 'Attachment Image';
   return (
     <GoodModal
       open={true}

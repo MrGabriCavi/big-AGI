@@ -5,9 +5,9 @@ import { useQuery } from '@tanstack/react-query';
 import type { SxProps } from '@mui/joy/styles/types';
 import { Box } from '@mui/joy';
 
-import type { DBlobAssetId, DBlobImageAsset } from '~/modules/dblobs/dblobs.types';
 import { t2iGenerateImageContentFragments } from '~/modules/t2i/t2i.client';
-import { useDBAsset } from '~/modules/dblobs/dblobs.hooks';
+
+import { DBlobAssetId, DBlobImageAsset, useDBAsset } from '~/common/stores/blob/dblobs-portability';
 
 import type { DMessageContentFragment } from '~/common/stores/chat/chat.fragments';
 import { humanReadableBytes } from '~/common/util/textUtils';
