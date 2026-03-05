@@ -5,7 +5,9 @@ import { AlreadySet } from '~/common/components/AlreadySet';
 import { ExternalLink } from '~/common/components/ExternalLink';
 import { FormInputKey } from '~/common/components/forms/FormInputKey';
 import { InlineError } from '~/common/components/InlineError';
+import { SetupFormClientSideToggle } from '~/common/components/forms/SetupFormClientSideToggle';
 import { SetupFormRefetchButton } from '~/common/components/forms/SetupFormRefetchButton';
+import { useToggleableBoolean } from '~/common/util/hooks/useToggleableBoolean';
 
 import { ApproximateCosts } from '../ApproximateCosts';
 import { useLlmUpdateModels } from '../../llm.client.hooks';
@@ -25,8 +27,12 @@ export function XAIServiceSetup(props: { serviceId: DModelsServiceId }) {
     useServiceSetup(props.serviceId, ModelVendorXAI);
 
   // derived state
-  const { oaiKey: xaiKey } = serviceAccess;
+  const { clientSideFetch, oaiKey: xaiKey } = serviceAccess;
   const needsUserKey = !serviceHasCloudTenantConfig;
+
+  // advanced mode - initialize open if CSF is enabled, but let user toggle freely
+  const advanced = useToggleableBoolean(!!clientSideFetch);
+  const showAdvanced = advanced.on;
 
   // key validation
   const shallFetchSucceed = !needsUserKey || (!!xaiKey && serviceSetupValid);
@@ -62,7 +68,14 @@ export function XAIServiceSetup(props: { serviceId: DModelsServiceId }) {
     {/*  onChange={(text) => updateSettings({ xaiHost: text })}*/}
     {/*/>*/}
 
-    <SetupFormRefetchButton refetch={refetch} disabled={isFetching} error={isError} loading={isFetching} />
+    {showAdvanced && <SetupFormClientSideToggle
+      visible={!!xaiKey}
+      checked={!!clientSideFetch}
+      onChange={on => updateSettings({ csf: on })}
+      helpText='Connect directly to xAI API from your browser instead of through the server.'
+    />}
+
+    <SetupFormRefetchButton refetch={refetch} disabled={isFetching} error={isError} loading={isFetching} advanced={advanced} />
 
     {isError && <InlineError error={error} />}
 

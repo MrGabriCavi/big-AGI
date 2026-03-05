@@ -7,12 +7,15 @@ import { persist } from 'zustand/middleware';
 
 import type { DOpenRouterServiceSettings } from '~/modules/llms/vendors/openrouter/openrouter.vendor';
 import type { IModelVendor } from '~/modules/llms/vendors/IModelVendor';
-import type { ModelVendorId } from '~/modules/llms/vendors/vendors.registry';
+import { createDLLMUserClone, getDLLMCloneId } from '~/modules/llms/llm.client';
+import { findModelVendor, type ModelVendorId } from '~/modules/llms/vendors/vendors.registry';
+
+import { hasKeys } from '~/common/util/objectUtils';
 
 import type { DModelDomainId } from './model.domains.types';
-import type { DModelParameterId, DModelParameterValues } from './llms.parameters';
 import type { DModelsService, DModelsServiceId } from './llms.service.types';
 import { DLLM, DLLMId, LLM_IF_OAI_Fn, LLM_IF_OAI_Vision } from './llms.types';
+import { DModelParameterId, DModelParameterRegistry, DModelParameterValues, LLMImplicitParametersRuntimeFallback } from './llms.parameters';
 import { createDModelConfiguration, DModelConfiguration } from './modelconfiguration.types';
 import { createLlmsAssignmentsSlice, LlmsAssignmentsActions, LlmsAssignmentsSlice, LlmsAssignmentsState, llmsHeuristicUpdateAssignments } from './store-llms-domains_slice';
 import { getDomainModelConfiguration } from './hooks/useModelDomain';
@@ -33,16 +36,23 @@ export interface LlmsRootState {
 
 interface LlmsRootActions {
 
-  setServiceLLMs: (serviceId: DModelsServiceId, serviceLLMs: ReadonlyArray<DLLM>, keepUserEdits: boolean, keepMissingLLMs: boolean) => void;
+  setServiceLLMs: (serviceId: DModelsServiceId, serviceLLMs: ReadonlyArray<DLLM>, keepUserEdits: true, keepMissingLLMs: false) => void;
   removeLLM: (id: DLLMId) => void;
+  removeCustomModels: (serviceId: DModelsServiceId) => void;
   rerankLLMsByServices: (serviceIdOrder: DModelsServiceId[]) => void;
   updateLLM: (id: DLLMId, partial: Partial<DLLM>) => void;
+  updateLLMs: (updates: Array<{ id: DLLMId; partial: Partial<DLLM> }>) => void;
   updateLLMUserParameters: (id: DLLMId, partial: Partial<DModelParameterValues>) => void;
   deleteLLMUserParameter: (id: DLLMId, parameterId: DModelParameterId) => void;
   resetLLMUserParameters: (id: DLLMId) => void;
+  resetServiceUserParameters: (serviceId: DModelsServiceId) => void;
+  resetServiceVisibility: (serviceId: DModelsServiceId) => void;
+  setServiceModelsHidden: (serviceId: DModelsServiceId, hidden: boolean) => void;
+  userCloneLLM: (sourceId: DLLMId, cloneLabel: string, cloneVariant: string) => DLLMId | null;
 
   createModelsService: (vendor: IModelVendor) => DModelsService;
   removeService: (id: DModelsServiceId) => void;
+  updateServiceLabel: (id: DModelsServiceId, label: string, allowEmpty?: boolean) => void;
   updateServiceSettings: <TServiceSettings>(id: DModelsServiceId, partialSettings: Partial<TServiceSettings>) => void;
 
   setConfServiceId: (id: DModelsServiceId | null) => void;
@@ -71,29 +81,89 @@ export const useModelsStore = create<LlmsStore>()(persist(
 
     // actions
 
-    setServiceLLMs: (serviceId: DModelsServiceId, serviceLLMs: ReadonlyArray<DLLM>, keepUserEdits: boolean, keepMissingLLMs: boolean) =>
-      set(({ llms: existingLLMs, modelAssignments }) => {
+    setServiceLLMs: (serviceId: DModelsServiceId, updatedServiceLLMs: ReadonlyArray<DLLM>, keepUserEdits: true, keepMissingLLMs: false) =>
+      set(({ llms, modelAssignments }) => {
 
-        // keep existing model customizations
-        if (keepUserEdits) {
-          serviceLLMs = serviceLLMs.map((llm: DLLM): DLLM => {
-            const existing = existingLLMs.find(m => m.id === llm.id);
-            return !existing ? llm : {
-              ...llm,
-              ...(existing.userLabel !== undefined ? { userLabel: existing.userLabel } : {}),
-              ...(existing.userHidden !== undefined ? { userHidden: existing.userHidden } : {}),
-              ...(existing.userStarred !== undefined ? { userStarred: existing.userStarred } : {}),
-              ...(existing.userParameters !== undefined ? { userParameters: { ...existing.userParameters } } : {}),
-            };
-          });
-        }
+        // separate existing models
+        const otherServiceLLMs = llms.filter(llm => llm.sId !== serviceId);
+        const previousServiceLLMs = llms.filter(llm => llm.sId === serviceId);
+        const consumedPreviousIds = new Set<DLLMId>();
 
-        // remove models that are not in the new list
-        if (!keepMissingLLMs)
-          existingLLMs = existingLLMs.filter(llm => llm.sId !== serviceId);
+        // process updated models, re-applying user customizations where applicable
+        const mergedServiceLLMs: DLLM[] = updatedServiceLLMs.map((llm: DLLM): DLLM => {
+          // new model: as-is
+          const e = previousServiceLLMs.find(m => m.id === llm.id);
+          if (!e) return llm;
 
-        // replace existing llms with the same id
-        const newLlms = [...serviceLLMs, ...existingLLMs.filter(existingLlm => !serviceLLMs.some(newLlm => newLlm.id === existingLlm.id))];
+          // mark this previous model as matched (consumed)
+          consumedPreviousIds.add(e.id);
+
+          // re-apply user edits from existing model to the new model data
+          if (!keepUserEdits) return llm;
+          const result: DLLM = {
+            ...llm,
+            ...(e.userLabel !== undefined ? { userLabel: e.userLabel } : {}),
+            ...(e.userHidden !== undefined ? { userHidden: e.userHidden } : {}),
+            ...(e.userStarred !== undefined ? { userStarred: e.userStarred } : {}),
+            ...(e.userContextTokens !== undefined ? { userContextTokens: e.userContextTokens } : {}),
+            ...(e.userMaxOutputTokens !== undefined ? { userMaxOutputTokens: e.userMaxOutputTokens } : {}),
+            ...(e.userPricing !== undefined ? { userPricing: e.userPricing } : {}),
+            ...(e.userParameters !== undefined ? { userParameters: { ...e.userParameters } } : {}),
+          };
+
+          // clean up stale parameters from userParameters -
+          // - e.g. was in the model spec but removed in the new version
+          // - or the value of an enum got removed, and so we remove ours
+          if (result.userParameters) {
+            for (const key of Object.keys(result.userParameters)) {
+              const paramId = key as DModelParameterId;
+
+              // keep implicit common parameters (always supported, not in parameterSpecs)
+              if (paramId in LLMImplicitParametersRuntimeFallback)
+                continue;
+
+              // remove parameters no longer in spec
+              const paramSpec = llm.parameterSpecs.find(spec => spec.paramId === paramId);
+              if (!paramSpec) {
+                delete result.userParameters[paramId];
+                continue;
+              }
+
+              // for enum types, validate the value is still in the allowed values
+              const regDef = DModelParameterRegistry[paramId];
+              if (regDef && regDef.type === 'enum' && 'values' in regDef && Array.isArray(regDef.values)) {
+                const currentValue = result.userParameters[paramId];
+                if (currentValue && typeof currentValue === 'string') {
+                  // reset to default - parameter definition does not contain this value anymore
+                  if (!(regDef.values as ReadonlyArray<string>).includes(currentValue)) {
+                    delete result.userParameters[paramId];
+                    console.log(`[DEV] Resetting '${paramId}' for '${llm.id}' because '${currentValue}' is no longer supported.`);
+                  }
+                  // reset to default - model parameter spec does not allow this value anymore
+                  else if (paramSpec.enumValues?.length && !paramSpec.enumValues.includes(currentValue)) {
+                    delete result.userParameters[paramId];
+                    console.log(`[DEV] Resetting '${paramId}' for '${llm.id}' because '${currentValue}' is no longer allowed for the model.`);
+                  }
+                }
+              }
+
+              // NOTE: no range validation for integer/float types yet. If added, be aware that
+              // llmVndAntThinkingBudget uses initialValue: -1 (out of range [1024, 65536]) as a
+              // sentinel for adaptive thinking mode on hidden params - range checks must skip hidden params.
+            }
+          }
+
+          return result;
+        });
+
+
+        // Always preserve custom models
+        // - NOTE: shall we check for the undelying ref to still be in the service, to auto-clean-up older models?
+        const customModels = previousServiceLLMs.filter(llm => llm.isUserClone === true && !consumedPreviousIds.has(llm.id));
+        const missingModels = !keepMissingLLMs ? [] : previousServiceLLMs.filter(llm => !llm.isUserClone && !consumedPreviousIds.has(llm.id));
+
+        // Build the final list in priority order
+        const newLlms = [...customModels, ...missingModels, ...mergedServiceLLMs, ...otherServiceLLMs];
         return {
           llms: newLlms,
           modelAssignments: llmsHeuristicUpdateAssignments(newLlms, modelAssignments),
@@ -103,6 +173,15 @@ export const useModelsStore = create<LlmsStore>()(persist(
     removeLLM: (id: DLLMId) =>
       set(state => {
         const newLlms = state.llms.filter(llm => llm.id !== id);
+        return {
+          llms: newLlms,
+          modelAssignments: llmsHeuristicUpdateAssignments(newLlms, state.modelAssignments),
+        };
+      }),
+
+    removeCustomModels: (serviceId: DModelsServiceId) =>
+      set(state => {
+        const newLlms = state.llms.filter(llm => !(llm.sId === serviceId && llm.isUserClone === true));
         return {
           llms: newLlms,
           modelAssignments: llmsHeuristicUpdateAssignments(newLlms, state.modelAssignments),
@@ -138,6 +217,19 @@ export const useModelsStore = create<LlmsStore>()(persist(
         ),
       })),
 
+    updateLLMs: (updates: Array<{ id: DLLMId; partial: Partial<DLLM> }>) =>
+      set(state => {
+        // Create a map of updates for efficient lookup
+        const updatesMap = new Map(updates.map(u => [u.id, u.partial]));
+
+        return {
+          llms: state.llms.map((llm: DLLM): DLLM => {
+            const partial = updatesMap.get(llm.id);
+            return partial ? { ...llm, ...partial } : llm;
+          }),
+        };
+      }),
+
     updateLLMUserParameters: (id: DLLMId, partialUserParameters: Partial<DModelParameterValues>) =>
       set(({ llms }) => ({
         llms: llms.map((llm: DLLM): DLLM =>
@@ -158,15 +250,76 @@ export const useModelsStore = create<LlmsStore>()(persist(
 
     resetLLMUserParameters: (id: DLLMId) =>
       set(({ llms }) => ({
+        llms: llms.map((llm: DLLM): DLLM => {
+          if (llm.id !== id) return llm;
+          // strip away user parameters and user label
+          const {
+            userParameters,
+            // userLabel, // not resetting the name for now
+            // userContextTokens, userMaxOutputTokens, userPricing, ...
+            ...rest
+          } = llm;
+          return rest;
+        }),
+      })),
+
+    resetServiceUserParameters: (serviceId: DModelsServiceId) =>
+      set(({ llms }) => ({
+        llms: llms.map((llm: DLLM): DLLM => {
+          if (llm.sId !== serviceId) return llm;
+          // strip away user parameters and user label
+          const {
+            userParameters,
+            userLabel, // service-wide reset includes resetting the name
+            // userContextTokens, userMaxOutputTokens, userPricing, ...
+            ...rest
+          } = llm;
+          return rest;
+        }),
+      })),
+
+    resetServiceVisibility: (serviceId: DModelsServiceId) =>
+      set(({ llms }) => ({
+        llms: llms.map((llm: DLLM): DLLM => {
+          if (llm.sId !== serviceId) return llm;
+          const { userHidden, ...rest } = llm;
+          return rest;
+        }),
+      })),
+
+    setServiceModelsHidden: (serviceId: DModelsServiceId, hidden: boolean) =>
+      set(({ llms }) => ({
         llms: llms.map((llm: DLLM): DLLM =>
-          llm.id === id
-            ? { ...llm, userParameters: {} }
+          llm.sId === serviceId
+            ? { ...llm, userHidden: hidden }
             : llm,
         ),
       })),
 
+    userCloneLLM: (sourceId: DLLMId, cloneLabel: string, cloneVariant: string): DLLMId | null => {
+      const { llms } = get();
+      const sourceLlm = llms.find(llm => llm.id === sourceId);
+      if (!sourceLlm) return null;
+
+      // check uniqueness
+      const cloneId = getDLLMCloneId(sourceId, cloneVariant);
+      if (llms.some(llm => llm.id === cloneId)) return null;
+
+      // create clone
+      const cloneLlm = createDLLMUserClone(sourceLlm, cloneLabel, cloneVariant);
+
+      // IMPORTANT: we have to have this LLM be part of the same group (or the UI will break on multiple-grouping)
+      const serviceStartIndex = llms.findIndex(llm => llm.sId === sourceLlm.sId);
+      const newLlms = [...llms];
+      newLlms.splice(serviceStartIndex, 0, cloneLlm);
+      set({ llms: newLlms });
+
+      return cloneId;
+    },
+
     createModelsService: (vendor: IModelVendor): DModelsService => {
 
+      // e.g. 'openai', 'openai-1', 'openai-2' - finds the first available slot
       function _locallyUniqueServiceId(vendorId: ModelVendorId, existingServices: DModelsService[]): DModelsServiceId {
         let serviceId: DModelsServiceId = vendorId;
         let serviceIdx = 0;
@@ -177,32 +330,35 @@ export const useModelsStore = create<LlmsStore>()(persist(
         return serviceId;
       }
 
-      function _relabelServicesFromSameVendor(vendorId: ModelVendorId, services: DModelsService[]): DModelsService[] {
-        let n = 0;
-        return services.map((s: DModelsService): DModelsService =>
-          (s.vId !== vendorId) ? s
-            : { ...s, label: s.label.replace(/ #\d+$/, '') + (++n > 1 ? ` #${n}` : '') },
-        );
+      // e.g. 'OpenAI', 'OpenAI #2', 'OpenAI #3' - uses max index + 1, never relabels existing
+      function _nextAutoLabelForVendor(vendorId: ModelVendorId, vendorName: string, existingServices: DModelsService[]): string {
+        const sameVendorServices = existingServices.filter(s => s.vId === vendorId);
+        if (sameVendorServices.length === 0)
+          return vendorName;
+        let maxIndex = 1;
+        for (const s of sameVendorServices) {
+          const match = s.label.match(/ #(\d+)$/);
+          if (match)
+            maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
+        }
+        return `${vendorName} #${maxIndex + 1}`;
       }
 
       const { sources: existingServices, confServiceId } = get();
 
-      // create the service
       const newService: DModelsService = {
         id: _locallyUniqueServiceId(vendor.id, existingServices),
-        label: vendor.name,
+        label: _nextAutoLabelForVendor(vendor.id, vendor.name, existingServices),
         vId: vendor.id,
         setup: vendor.initializeSetup?.() || {},
       };
 
-      const newServices = _relabelServicesFromSameVendor(vendor.id, [...existingServices, newService]);
-
       set({
-        sources: newServices,
+        sources: [...existingServices, newService],
         confServiceId: confServiceId ?? newService.id,
       });
 
-      return newServices[newServices.length - 1];
+      return newService;
     },
 
     removeService: (id: DModelsServiceId) =>
@@ -212,6 +368,26 @@ export const useModelsStore = create<LlmsStore>()(persist(
           llms,
           sources: state.sources.filter(s => s.id !== id),
           modelAssignments: llmsHeuristicUpdateAssignments(llms, state.modelAssignments),
+        };
+      }),
+
+    updateServiceLabel: (id: DModelsServiceId, label: string, allowEmpty: boolean = false) =>
+      set(state => {
+        // fallback label to vendor name if empty
+        if (!allowEmpty && !label.trim()) {
+          const service = state.sources.find(s => s.id === id);
+          const vendor = service ? findModelVendor(service.vId) : null;
+          label = vendor?.name || label;
+        }
+        // allow max of 32 chars for the name
+        if (label.length > 32)
+          label = label.substring(0, 32);
+        return {
+          sources: state.sources.map((s: DModelsService): DModelsService =>
+            s.id === id
+              ? { ...s, label: label }
+              : s,
+          ),
         };
       }),
 
@@ -246,9 +422,9 @@ export const useModelsStore = create<LlmsStore>()(persist(
     /* versioning:
      *  1: adds maxOutputTokens (default to half of contextTokens)
      *  2: large changes on all LLMs, and reset chat/fast/func LLMs
-     *  3: big-AGI v2
+     *  3: big-AGI v2.x upgrade
      *  4: migrate .options to .initialParameters/.userParameters
-     *  4B: we changed from .chatLLMId/.fastLLMId to modelAssignments: {}, without expicit migration (done on rehydrate, and for no particular reason)
+     *  4B: we changed from .chatLLMId/.fastLLMId to modelAssignments: {}, without explicit migration (done on rehydrate, and for no particular reason)
      */
     version: 4,
     migrate: (_state: any, fromVersion: number): LlmsStore => {
@@ -259,7 +435,7 @@ export const useModelsStore = create<LlmsStore>()(persist(
       // 0 -> 1: add 'maxOutputTokens' where missing
       if (fromVersion < 1)
         for (const llm of state.llms)
-          if (llm.maxOutputTokens === undefined)
+          if (llm.maxOutputTokens === undefined) // direct access ok
             llm.maxOutputTokens = llm.contextTokens ? Math.round(llm.contextTokens / 2) : null;
 
       // 1 -> 2: large changes
@@ -271,7 +447,7 @@ export const useModelsStore = create<LlmsStore>()(persist(
         }
       }
 
-      // 2 -> 3: big-AGI v2: update all models for pricing info
+      // 2 -> 3: big-AGI v2.x upgrade: update all models for pricing info
       if (fromVersion < 3) {
         try {
           state.llms.forEach(portModelPricingV2toV3);
@@ -318,7 +494,7 @@ export const useModelsStore = create<LlmsStore>()(persist(
       // Select the best LLMs automatically, if not set
       try {
         //  auto-detect assignments, or re-import them from the old format
-        if (!state.modelAssignments || !Object.keys(state.modelAssignments).length) {
+        if (!hasKeys(state.modelAssignments)) {
 
           // reimport the former chatLLMId and fastLLMId if set
           const prevState = state as { chatLLMId?: DLLMId, fastLLMId?: DLLMId };

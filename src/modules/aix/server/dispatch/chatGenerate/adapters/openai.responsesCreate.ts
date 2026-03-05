@@ -1,4 +1,6 @@
-import type { OpenAIDialects } from '~/modules/llms/server/openai/openai.router';
+import * as z from 'zod/v4';
+
+import type { OpenAIDialects } from '~/modules/llms/server/openai/openai.access';
 
 import { AixAPI_Model, AixAPIChatGenerate_Request, AixMessages_ChatMessage, AixMessages_SystemMessage, AixTools_ToolDefinition, AixTools_ToolsPolicy } from '../../../api/aix.wiretypes';
 import { OpenAIWire_API_Responses, OpenAIWire_Responses_Items, OpenAIWire_Responses_Tools } from '../../wiretypes/openai.wiretypes';
@@ -23,21 +25,26 @@ type TRequestTool = OpenAIWire_Responses_Tools.Tool;
  * - much side functionality is not implemented yet
  * - testing with o3-pro only for now
  */
-export function aixToOpenAIResponses(openAIDialect: OpenAIDialects, model: AixAPI_Model, _chatGenerate: AixAPIChatGenerate_Request, jsonOutput: boolean, streaming: boolean): TRequest {
+export function aixToOpenAIResponses(
+  openAIDialect: OpenAIDialects,
+  model: AixAPI_Model,
+  _chatGenerate: AixAPIChatGenerate_Request,
+  streaming: boolean,
+  enableResumability: boolean,
+): TRequest {
 
   // Pre-process CGR - approximate spill of System to User message
   const chatGenerate = aixSpillSystemToUser(_chatGenerate);
 
   // [OpenAI] Vendor-specific model checks
-  const isOpenAIOFamily = ['gpt-6', 'gpt-5', 'o4', 'o3', 'o1'].some(_id => model.id === _id || model.id.startsWith(_id + '-'));
-  const isOpenAIChatGPT = ['gpt-5-chat'].some(_id => model.id === _id || model.id.startsWith(_id + '-'));
   const isOpenAIComputerUse = model.id.includes('computer-use');
-  const isOpenAIO1Pro = model.id === 'o1-pro' || model.id.startsWith('o1-pro-');
-  const isOpenAIDeepResearch = model.id.includes('-deep-research');
 
-  const hotFixNoTemperature = isOpenAIOFamily && !isOpenAIChatGPT;
+  // NOTE: we do not use this anymore - LLM_IF_HOTFIX_NoTemperature works in definition, UI, and client calls
+  // const isOpenAIOFamily = ['gpt-6', 'gpt-5', 'o4', 'o3', 'o1'].some(_id => model.id === _id || model.id.startsWith(_id + '-'));
+  // const isOpenAIChatGPT = ['gpt-5-chat'].some(_id => model.id === _id || model.id.startsWith(_id + '-'));
+  const forceNoTemperature = false;  // isOpenAIOFamily && !isOpenAIChatGPT;
+
   const hotFixNoTruncateAuto = isOpenAIComputerUse;
-  const hotFixForceWebSearchTool = isOpenAIDeepResearch;
 
   const isDialectAzure = openAIDialect === 'azure';
 
@@ -46,13 +53,17 @@ export function aixToOpenAIResponses(openAIDialect: OpenAIDialects, model: AixAP
   // NOTE: the zod parsing will remove the undefined values from the upstream request, enabling an easier construction
   // ---
 
+  // constrained output modes - both JSON and tool invocations
+  // const strictJsonOutput = !!model.strictJsonOutput;
+  const strictToolInvocations = !!model.strictToolInvocations;
+
   const { requestInput, requestInstructions } = _toOpenAIResponsesRequestInput(chatGenerate.systemMessage, chatGenerate.chatSequence);
   const payload: TRequest = {
 
     // Model configuration
     model: model.id,
     max_output_tokens: model.maxTokens ?? undefined, // response if unset: null
-    temperature: !hotFixNoTemperature ? model.temperature ?? undefined : undefined,
+    temperature: !forceNoTemperature ? model.temperature ?? undefined : undefined,
     // top_p: ... below (alternative to temperature)
 
     // Input
@@ -60,27 +71,26 @@ export function aixToOpenAIResponses(openAIDialect: OpenAIDialects, model: AixAP
     input: requestInput,
 
     // Tools
-    tools: chatGenerate.tools && _toOpenAIResponsesTools(chatGenerate.tools),
+    tools: chatGenerate.tools && _toOpenAIResponsesTools(chatGenerate.tools, strictToolInvocations),
     tool_choice: chatGenerate.toolsPolicy && _toOpenAIResponsesToolChoice(chatGenerate.toolsPolicy),
     // parallel_tool_calls: undefined, // response if unset: true
 
-    // Operations Config
-    reasoning: !model.vndOaiReasoningEffort ? undefined : {
-      effort: model.vndOaiReasoningEffort,
-      summary: !isOpenAIO1Pro ? 'detailed' : 'auto', // elevated from 'auto' (o1-pro still at 'auto')
-    },
+    // Operations Config - use unified effort, fall back to deprecated field
+    // reasoning: ... below
 
     // Output Config
     // text: ... below
 
     // API state management
-    store: false, // default would be 'true'
+    /** Default for resumability is true, however we set it to false unless explicitly requested. */
+    store: enableResumability ?? false, // enable storage for resumability if requested
     // previous_response_id: undefined,
 
     // API options
     stream: streaming,
     // background: false, // response if unset: false
     truncation: !hotFixNoTruncateAuto ? OPENAI_RESPONSES_DEFAULT_TRUNCATION : 'auto',
+    // include: [], // we incrementally build this below, on-demand
     // user: undefined,
 
   };
@@ -91,14 +101,35 @@ export function aixToOpenAIResponses(openAIDialect: OpenAIDialects, model: AixAP
     payload.top_p = model.topP;
   }
 
-  // JSON output: not implemented yet - will need a schema definition (similar to the tool args definition)
-  if (jsonOutput) {
-    console.warn('[DEV] notImplemented: responses: jsonOutput');
-    // payload.text = {
-    //   format: {
-    //     type: 'json_schema',
-    //   },
-    // };
+  // Structured Outputs - JSON output grammar
+  if (model.strictJsonOutput)
+    payload.text = {
+      ...payload.text,
+      format: {
+        type: 'json_schema',
+        name: model.strictJsonOutput.name || 'response',
+        description: model.strictJsonOutput.description,
+        schema: model.strictJsonOutput.schema,
+        strict: true,
+      },
+    };
+
+
+  // Reasoning
+  const reasoningEffort = model.reasoningEffort; // ?? model.vndOaiReasoningEffort;
+  if (reasoningEffort === 'max') // domain validation
+    throw new Error(`OpenAI Responses API does not support '${reasoningEffort}' reasoning effort`);
+
+  if (reasoningEffort) {
+    payload.reasoning = {
+      effort: reasoningEffort,
+    };
+    // include detailed reasoning summaries, unless the user has asked to bypass the OpenAI Org verification (via the forceNoStream flag)
+    const specialExclusions = [
+      'o1-pro', // found manually: unsupported parameter: 'reasoning.summary' is not supported with the 'o1-pro-2025-03-19' model
+    ].some(_id => model.id === _id || model.id.startsWith(_id + '-'));
+    if (reasoningEffort !== 'none' && !model.forceNoStream && !specialExclusions)
+      payload.reasoning.summary = 'detailed';
   }
 
   // GPT-5 Verbosity: Add to existing text config or create new one
@@ -109,44 +140,117 @@ export function aixToOpenAIResponses(openAIDialect: OpenAIDialects, model: AixAP
     };
   }
 
+  // --- Tools ---
+
+  // Allow/deny auto-adding hosted tools when custom tools are present
+  const hasCustomTools = chatGenerate.tools?.some(t => t.type === 'function_call');
+  const hasRestrictivePolicy = chatGenerate.toolsPolicy?.type === 'any' || chatGenerate.toolsPolicy?.type === 'function_call';
+  const skipHostedToolsDueToCustomTools = hasCustomTools && hasRestrictivePolicy;
+
   // Tool: Web Search: for search and deep research models
-  const requestWebSearchTool = hotFixForceWebSearchTool || !!model.vndOaiWebSearchContext || !!model.userGeolocation;
-  if (requestWebSearchTool) {
+  const requestWebSearchTool = !!model.vndOaiWebSearchContext || !!model.userGeolocation;
+  if (requestWebSearchTool && !skipHostedToolsDueToCustomTools) {
     /**
-     * NOTE: as of 2025-09-12, we still get the "Hosted tool 'web_search_preview' is not supported with gpt-5-mini-2025-08-07"
+     * NOTE: as of 2025-09-12, we still get the "Hosted tool 'web_search' is not supported with gpt-5-mini-2025-08-07"
      *       warning from Azure OpenAI V1. We shall check in the future if this is resolved.
      */
     if (isDialectAzure) {
-      // Azure OpenAI doesn't support web search tool yet (as of Aug 2025)
+      // [2025-11-18] Azure OpenAI still doesn't support web search tool yet - confirmed
+      // [2025-09-12] Azure OpenAI doesn't support web search tool yet, and we also remove the "parameter" so we shall not come here
       console.log('[DEV] Azure OpenAI Responses: skipping web search tool due to Azure limitations');
-    } else if (payload.reasoning?.effort === 'minimal') {
-      // Web search is not supported when the reasoning effort is 'minimal'
+    } else if (reasoningEffort === 'minimal') {
+      // 2026-02-17: Validated: Web search is not supported when the reasoning effort is 'minimal'
       // console.log('[DEV] OpenAI Responses: skipping web search tool due to reasoning effort being set to minimal');
     } else {
+
+      // Add the web search tool to the request
       if (!payload.tools?.length)
         payload.tools = [];
-      const webSearchTool: TRequestTool = {
-        type: 'web_search_preview',
+      const webSearchTool: TRequestTool = model.id.includes('-deep-research') ? {
+        type: 'web_search_preview', // HOTFIX for deep research models, which only seem to support the outdated 'web_search_preview' tool
+      } : {
+        type: 'web_search',
         search_context_size: model.vndOaiWebSearchContext ?? undefined,
         user_location: model.userGeolocation && {
           type: 'approximate',
           ...model.userGeolocation, // .city, .country, .region, .timezone
         },
+        external_web_access: true, // true: live internet access, false: cache-only
       };
       payload.tools.push(webSearchTool);
+
+      // Include all sources (web search list of URLs, but not high quality links at all) in the response ('web_search_call.action.sources')
+      const extendedInclude = new Set(payload.include);
+      extendedInclude.add('web_search_call.action.sources');
+      payload.include = Array.from(extendedInclude);
+
     }
   }
 
+  // Tool: Image Generation: configurable per model
+  const requestImageGenerationTool = !!model.vndOaiImageGeneration;
+  if (requestImageGenerationTool && !skipHostedToolsDueToCustomTools) {
+    /**
+     * [2025-11-18] Azure OpenAI Image Generation limitations:
+     * - does not support image generation tool at all ({"type":"error","error":{"type":"invalid_request_error","code":null,"message":"There was an issue with your request. Please check your inputs and try again","param":null}})
+     * - does not support WebP output format
+     */
+    const azureImageWorkarounds = isDialectAzure;
+    if (azureImageWorkarounds)
+      console.warn('[DEV] Azure OpenAI Responses: trying image generation tool despite Azure limitations');
+
+    // Add the image generation tool to the request
+    if (!payload.tools?.length)
+      payload.tools = [];
+
+    // Map enum values to tool configuration
+    const imageMode = model.vndOaiImageGeneration;
+    const imageGenerationTool: Extract<TRequestTool, { type: 'image_generation' }> = {
+      type: 'image_generation',
+      ...(imageMode === 'mq' ? { quality: 'medium' } : { /* quality: 'high' -- auto */ }),
+      // ...(imageMode === 'hq' ? ... auto ... ),
+      ...(imageMode === 'hq_edit' && { input_fidelity: 'high' }),
+      ...(imageMode !== 'hq_png' && !azureImageWorkarounds && { output_format: 'webp' }),
+      moderation: 'low',
+    };
+    payload.tools.push(imageGenerationTool);
+  }
+
+  // Tool: Code Interpreter: Python code execution in sandboxed container ($0.03/container)
+  const requestCodeInterpreterTool = model.vndOaiCodeInterpreter === 'auto';
+  if (requestCodeInterpreterTool && !skipHostedToolsDueToCustomTools) {
+    if (isDialectAzure) {
+      console.log('[DEV] Azure OpenAI Responses: skipping code interpreter tool due to Azure limitations');
+    } else {
+      // Add the code interpreter tool to the request
+      if (!payload.tools?.length)
+        payload.tools = [];
+
+      payload.tools.push({
+        type: 'code_interpreter',
+        container: { type: 'auto' }, // auto-create/reuse container
+      });
+
+      // Include code execution outputs in the response
+      const extendedInclude = new Set(payload.include);
+      extendedInclude.add('code_interpreter_call.outputs');
+      payload.include = Array.from(extendedInclude);
+    }
+  }
+
+
   // [OpenAI] Vendor-specific restore markdown, for GPT-5 models and recent 'o' models
-  if (model.vndOaiRestoreMarkdown)
+  const skipMarkdownDueToCustomTools = hasCustomTools && hasRestrictivePolicy;
+  if (model.vndOaiRestoreMarkdown && !skipMarkdownDueToCustomTools)
     vndOaiRestoreMarkdown(payload);
+
 
   // Preemptive error detection with server-side payload validation before sending it upstream
   // this includes stripping 'undefined' fields
   const validated = OpenAIWire_API_Responses.Request_schema.safeParse(payload);
   if (!validated.success) {
-    console.warn('[DEV] OpenAI: invalid Responses request payload. Error:', { error: validated.error });
-    throw new Error(`Invalid sequence for OpenAI models: ${validated.error.issues?.[0]?.message || validated.error.message || validated.error}.`);
+    console.warn('[DEV] OpenAI: invalid Responses request payload. Error:', { valError: validated.error });
+    throw new Error(`Invalid request for OpenAI models: ${z.prettifyError(validated.error)}`);
   }
 
   return validated.data;
@@ -195,6 +299,7 @@ function _toOpenAIResponsesRequestInput(systemMessage: AixMessages_SystemMessage
   type FunctionCallOutputMessage = OpenAIWire_Responses_Items.FunctionToolCallOutput;
 
   let allowUserAppend = true;
+
   function userMessage() {
     // Ensure the last message is a user message, or create a new one
     let lastMessage = chatMessages.length ? chatMessages[chatMessages.length - 1] : undefined;
@@ -424,7 +529,7 @@ function _toOpenAIResponsesRequestInput(systemMessage: AixMessages_SystemMessage
   };
 }
 
-function _toOpenAIResponsesTools(itds: AixTools_ToolDefinition[]): NonNullable<TRequestTool[]> {
+function _toOpenAIResponsesTools(itds: AixTools_ToolDefinition[], strictToolInvocations: boolean): NonNullable<TRequestTool[]> {
   return itds.map(itd => {
     const itdType = itd.type;
     switch (itdType) {
@@ -439,7 +544,9 @@ function _toOpenAIResponsesTools(itds: AixTools_ToolDefinition[]): NonNullable<T
             type: 'object',
             properties: input_schema?.properties ?? {},
             required: input_schema?.required,
+            ...(strictToolInvocations ? { additionalProperties: false } : {}), // required for strict tool invocations
           },
+          ...(strictToolInvocations ? { strict: true } : {}), // enable strict (grammar-constrained) tool invocation inputs
         };
 
       case 'code_execution':
@@ -471,12 +578,12 @@ function _toOpenAIResponsesToolChoice(itp: AixTools_ToolsPolicy): NonNullable<TR
 
 /**
  * Adds GPT-5 specific markdown instructions to Responses API payload.
- * 
- * Background: 
+ *
+ * Background:
  * GPT-5 benefits from explicit markdown formatting guidance per the GPT-5 prompting guide.
  * This function adds the recommended markdown instructions to the instructions field.
- * 
- * References: 
+ *
+ * References:
  * - GPT-5 prompting guide markdown section
  */
 export function vndOaiRestoreMarkdown(payload: TRequest) {

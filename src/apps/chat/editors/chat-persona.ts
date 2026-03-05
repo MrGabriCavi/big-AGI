@@ -1,4 +1,4 @@
-import { AixChatGenerateContent_DMessage, aixChatGenerateContent_DMessage_FromConversation } from '~/modules/aix/client/aix.client';
+import { aixChatGenerateContent_DMessage_FromConversation, AixChatGenerateContent_DMessageGuts } from '~/modules/aix/client/aix.client';
 import { autoChatFollowUps } from '~/modules/aifn/auto-chat-follow-ups/autoChatFollowUps';
 import { autoConversationTitle } from '~/modules/aifn/autotitle/autoTitle';
 
@@ -7,7 +7,7 @@ import type { DLLMId } from '~/common/stores/llms/llms.types';
 import { AudioGenerator } from '~/common/util/audio/AudioGenerator';
 import { ConversationsManager } from '~/common/chat-overlay/ConversationsManager';
 import { DMessage, MESSAGE_FLAG_NOTIFY_COMPLETE, messageWasInterruptedAtStart } from '~/common/stores/chat/chat.message';
-import { getUXLabsHighPerformance } from '~/common/stores/store-ux-labs';
+import { getLabsHighPerformance } from '~/common/stores/store-ux-labs';
 
 import { PersonaChatMessageSpeak } from './persona/PersonaChatMessageSpeak';
 import { getChatAutoAI, getIsNotificationEnabledForModel } from '../store-app-chat';
@@ -19,7 +19,7 @@ export const CHATGENERATE_RESPONSE_PLACEHOLDER = '...'; // 💫 ..., 🖊️ ...
 
 
 export interface PersonaProcessorInterface {
-  handleMessage(accumulatedMessage: AixChatGenerateContent_DMessage, messageComplete: boolean): void;
+  handleMessage(accumulatedMessage: AixChatGenerateContent_DMessageGuts, messageComplete: boolean): void;
 }
 
 
@@ -52,10 +52,10 @@ export async function runPersonaOnConversationHead(
     },
   );
 
-  const parallelViewCount = getUXLabsHighPerformance() ? 0 : getInstantAppChatPanesCount();
+  const parallelViewCount = getLabsHighPerformance() ? 0 : getInstantAppChatPanesCount();
 
   // ai follow-up operations (fire/forget)
-  const { autoSpeak, autoSuggestDiagrams, autoSuggestHTMLUI, autoSuggestQuestions, autoTitleChat, chatKeepLastThinkingOnly } = getChatAutoAI();
+  const { autoSpeak, autoSuggestDiagrams, autoSuggestHTMLUI, autoSuggestQuestions, autoTitleChat, chatThinkingPolicy } = getChatAutoAI();
 
   // AutoSpeak
   const autoSpeaker: PersonaProcessorInterface | null = autoSpeak !== 'off' ? new PersonaChatMessageSpeak(autoSpeak) : null;
@@ -72,7 +72,7 @@ export async function runPersonaOnConversationHead(
     'conversation',
     conversationId,
     { abortSignal: abortController.signal, throttleParallelThreads: parallelViewCount },
-    (messageOverwrite: AixChatGenerateContent_DMessage, messageComplete: boolean) => {
+    (messageOverwrite: AixChatGenerateContent_DMessageGuts, messageComplete: boolean) => {
 
       // Note: there was an abort check here, but it removed the last packet, which contained the cause and final text.
       // if (abortController.signal.aborted)
@@ -129,8 +129,10 @@ export async function runPersonaOnConversationHead(
   if (!hasBeenAborted && (autoSuggestDiagrams || autoSuggestHTMLUI || autoSuggestQuestions))
     void autoChatFollowUps(conversationId, assistantMessageId, autoSuggestDiagrams, autoSuggestHTMLUI, autoSuggestQuestions);
 
-  if (chatKeepLastThinkingOnly)
-    cHandler.historyKeepLastThinkingOnly();
+  if (chatThinkingPolicy === 'last-only')
+    cHandler.historyStripThinking(1);
+  else if (chatThinkingPolicy === 'discard-all')
+    cHandler.historyStripThinking(0);
 
   // return true if this succeeded
   return messageStatus.outcome === 'success';

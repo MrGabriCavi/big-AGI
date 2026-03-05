@@ -6,9 +6,9 @@ import CloseRoundedIcon from '@mui/icons-material/CloseRounded';
 import DeleteForeverIcon from '@mui/icons-material/DeleteForever';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
-import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import ReplayIcon from '@mui/icons-material/Replay';
 import WarningRoundedIcon from '@mui/icons-material/WarningRounded';
+import ZoomOutMapIcon from '@mui/icons-material/ZoomOutMap';
 
 import { Link } from '~/common/components/Link';
 
@@ -173,7 +173,6 @@ export const RenderImageURL = (props: {
           {/* Image / Loading Indicator */}
           {props.imageURL ? (
             <picture>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={props.imageURL} alt={props.expandableText ? `Generated Image: ${props.expandableText}` : 'Generated Image'} />
             </picture>
           ) : (
@@ -231,11 +230,11 @@ export const RenderImageURL = (props: {
           {!!props.imageURL && (
             props.onViewImage ? (
               <OverlayButton tooltip='View Image' variant='outlined' color={isCard ? 'primary' : undefined} onClick={handleViewImage} sx={{ gridRow: '1', gridColumn: '2' }}>
-                <OpenInNewIcon />
+                <ZoomOutMapIcon />
               </OverlayButton>
             ) : props.imageURL.startsWith('http') ? (
               <StyledOverlayButton variant='outlined' color={isCard ? 'primary' : undefined} component={Link} href={props.imageURL} download={props.expandableText || 'Image'} target='_blank' sx={{ gridRow: '1', gridColumn: '2' }}>
-                <OpenInNewIcon />
+                <ZoomOutMapIcon />
               </StyledOverlayButton>
             ) : <span />
           )}

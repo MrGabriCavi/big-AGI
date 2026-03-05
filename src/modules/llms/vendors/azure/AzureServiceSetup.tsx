@@ -1,6 +1,7 @@
 import * as React from 'react';
 
-import { Chip, Typography } from '@mui/joy';
+import { Chip, IconButton, Typography } from '@mui/joy';
+import RestartAltIcon from '@mui/icons-material/RestartAlt';
 
 import type { DModelsServiceId } from '~/common/stores/llms/llms.service.types';
 import { AlreadySet } from '~/common/components/AlreadySet';
@@ -9,8 +10,10 @@ import { FormInputKey } from '~/common/components/forms/FormInputKey';
 import { FormTextField } from '~/common/components/forms/FormTextField';
 import { InlineError } from '~/common/components/InlineError';
 import { Link } from '~/common/components/Link';
+import { SetupFormClientSideToggle } from '~/common/components/forms/SetupFormClientSideToggle';
 import { SetupFormRefetchButton } from '~/common/components/forms/SetupFormRefetchButton';
 import { asValidURL } from '~/common/util/urlUtils';
+import { useToggleableBoolean } from '~/common/util/hooks/useToggleableBoolean';
 
 import { ApproximateCosts } from '../ApproximateCosts';
 import { useLlmUpdateModels } from '../../llm.client.hooks';
@@ -25,12 +28,16 @@ export function AzureServiceSetup(props: { serviceId: DModelsServiceId }) {
   const [checkboxExpanded, setCheckboxExpanded] = React.useState(false);
 
   // external state
-  const { service, serviceAccess, serviceHasCloudTenantConfig, serviceHasLLMs, updateSettings } =
+  const { service, serviceAccess, serviceHasCloudTenantConfig, serviceHasLLMs, updateSettings, updateLabel } =
     useServiceSetup(props.serviceId, ModelVendorAzure);
 
   // derived state
-  const { oaiKey: azureKey, oaiHost: azureEndpoint } = serviceAccess;
+  const { clientSideFetch, oaiKey: azureKey, oaiHost: azureEndpoint } = serviceAccess;
   const needsUserKey = !serviceHasCloudTenantConfig;
+
+  // advanced mode - initialize open if CSF is enabled, but let user toggle freely
+  const advanced = useToggleableBoolean(!!clientSideFetch);
+  const showAdvanced = advanced.on;
 
   const keyValid = isValidAzureApiKey(azureKey);
   const keyError = (/*needsUserKey ||*/ !!azureKey) && !keyValid;
@@ -81,7 +88,27 @@ export function AzureServiceSetup(props: { serviceId: DModelsServiceId }) {
       placeholder='...'
     />
 
-    <SetupFormRefetchButton refetch={refetch} disabled={!shallFetchSucceed || isFetching} loading={isFetching} error={isError} />
+    {showAdvanced && <FormTextField
+      autoCompleteId='azure-service-name'
+      title='Custom Name'
+      placeholder='e.g., My Azure OpenAI, etc.'
+      value={service?.label || ''}
+      onChange={updateLabel}
+      endDecorator={
+        <IconButton size='sm' variant='plain' color='neutral' onClick={() => updateLabel('')}>
+          <RestartAltIcon />
+        </IconButton>
+      }
+    />}
+
+    {showAdvanced && <SetupFormClientSideToggle
+      visible={!!(azureKey && azureEndpoint)}
+      checked={!!clientSideFetch}
+      onChange={on => updateSettings({ csf: on })}
+      helpText='Connect directly to Azure OpenAI API from your browser instead of through the server.'
+    />}
+
+    <SetupFormRefetchButton refetch={refetch} disabled={!shallFetchSucceed || isFetching} loading={isFetching} error={isError} advanced={advanced} />
 
     {isError && <InlineError error={error} />}
 

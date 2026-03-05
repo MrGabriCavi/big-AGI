@@ -1,20 +1,22 @@
 import * as React from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
-import { Avatar, Badge, Box, Button, Chip, CircularProgress, Input, Sheet, Typography } from '@mui/joy';
+import { Avatar, Badge, Box, Button, Chip, CircularProgress, Sheet, Typography } from '@mui/joy';
 
+import { FormInputKey } from '~/common/components/forms/FormInputKey';
 import { TooltipOutlined } from '~/common/components/TooltipOutlined';
 import { llmsStoreActions, llmsStoreState, useModelsStore } from '~/common/stores/llms/store-llms';
 import { useShallowStabilizer } from '~/common/util/hooks/useShallowObject';
 
 import type { IModelVendor } from '../vendors/IModelVendor';
-import { LLMVendorIcon } from '../components/LLMVendorIcon';
+import { LLMVendorIconSprite } from '../components/LLMVendorIconSprite';
 import { ModelVendorAnthropic } from '../vendors/anthropic/anthropic.vendor';
 import { ModelVendorGemini } from '../vendors/gemini/gemini.vendor';
 import { ModelVendorLMStudio } from '../vendors/lmstudio/lmstudio.vendor';
 import { ModelVendorLocalAI } from '../vendors/localai/localai.vendor';
 import { ModelVendorOllama } from '../vendors/ollama/ollama.vendor';
 import { ModelVendorOpenAI } from '../vendors/openai/openai.vendor';
+import { ModelVendorOpenRouter } from '../vendors/openrouter/openrouter.vendor';
 import { llmsUpdateModelsForServiceOrThrow } from '../llm.client';
 
 
@@ -23,17 +25,17 @@ const WizardProviders: ReadonlyArray<WizardProvider> = [
   { cat: 'popular', vendor: ModelVendorOpenAI, settingsKey: 'oaiKey' } as const,
   { cat: 'popular', vendor: ModelVendorAnthropic, settingsKey: 'anthropicKey' } as const,
   { cat: 'popular', vendor: ModelVendorGemini, settingsKey: 'geminiKey' } as const,
+  { cat: 'popular', vendor: ModelVendorOpenRouter, settingsKey: 'oaiKey' } as const,
   { cat: 'local', vendor: ModelVendorLocalAI, settingsKey: 'localAIHost' } as const,
   { cat: 'local', vendor: ModelVendorOllama, settingsKey: 'ollamaHost' } as const,
   { cat: 'local', vendor: ModelVendorLMStudio, settingsKey: 'oaiHost', omit: true } as const,
-  // { vendor: ModelVendorOpenRouter, settingsKey: 'oaiKey' } as const,
 ] as const;
 
 type VendorCategory = 'popular' | 'local';
 
 interface WizardProvider {
   cat: VendorCategory,
-  vendor: IModelVendor<Record<string, any>, Record<string, any>>,
+  vendor: IModelVendor<Record<string, any>>,
   settingsKey: string,
   omit?: boolean,
 }
@@ -42,12 +44,17 @@ interface WizardProvider {
 const _styles = {
 
   container: {
-    margin: 'calc(-1 * var(--Card-padding, 1rem))',
+    mx: 'calc(-1 * var(--Card-padding, 1rem))',
     padding: 'var(--Card-padding)',
+    borderTop: '1px solid',
+    borderBottom: '1px solid',
+    borderColor: 'divider',
     // paddingRight: 'calc(1.5 * var(--Card-padding))',
     // background: 'linear-gradient(135deg, var(--joy-palette-primary-500), var(--joy-palette-primary-700))',
     // background: 'linear-gradient(135deg, var(--joy-palette-background-level1), var(--joy-palette-background-level1))',
-    display: 'grid',
+    display: 'flex',
+    flexDirection: 'column',
+    flexGrow: 1,
     gap: 'calc(0.75 * var(--Card-padding))',
   } as const,
 
@@ -86,6 +93,7 @@ function WizardProviderSetup(props: {
   provider: WizardProvider,
   isFirst: boolean,
   isHidden: boolean,
+  onUnsavedChange: (providerId: string, hasUnsaved: boolean) => void,
 }) {
 
   const { cat: providerCat, vendor: providerVendor, settingsKey: providerSettingsKey, omit: providerOmit } = props.provider;
@@ -126,12 +134,28 @@ function WizardProviderSetup(props: {
   const valueName = isLocal ? 'server' : 'API Key';
   const { name: vendorName } = providerVendor;
 
+  // use consistent autoCompleteId pattern: vendor-key for API keys, vendor-host for servers
+  const autoCompleteId = isLocal ? `${providerVendor.id}-host` : `${providerVendor.id}-key`;
+
+
+  // wrapped setter that notifies parent of unsaved state
+
+  const { onUnsavedChange } = props;
+
+  const handleLocalValueChange = React.useCallback((newValue: string) => {
+    // set locally
+    setLocalValue(newValue);
+
+    // notify parent of unsaved state
+    if (providerOmit || !onUnsavedChange) return;
+    const hasUnsaved = newValue !== (serviceKeyValue || '');
+    const hasValue = !!newValue.trim();
+    onUnsavedChange(providerVendor.id, hasUnsaved && hasValue);
+  }, [onUnsavedChange, providerOmit, providerVendor.id, serviceKeyValue]);
+
 
   // handlers
 
-  const handleTextChanged = React.useCallback((e: React.ChangeEvent) => {
-    setLocalValue((e.target as HTMLInputElement).value);
-  }, []);
 
   const handleSetServiceKeyValue = React.useCallback(async () => {
 
@@ -145,10 +169,14 @@ function WizardProviderSetup(props: {
     const newKey = localValue?.trim() ?? '';
     updateServiceSettings(vendorServiceId, { [providerSettingsKey]: newKey });
 
+    // notify parent that changes are now saved
+    if (!providerOmit)
+      onUnsavedChange(providerVendor.id, false);
+
     // if the key is empty, remove the models
     if (!newKey) {
       setUpdateError(null);
-      setServiceLLMs(vendorServiceId, [], false, false);
+      setServiceLLMs(vendorServiceId, [], true, false);
       return;
     }
 
@@ -162,11 +190,11 @@ function WizardProviderSetup(props: {
       if (errorText.includes('Incorrect API key'))
         errorText = '[OpenAI issue] Unauthorized: Incorrect API key.';
       setUpdateError(errorText);
-      setServiceLLMs(vendorServiceId, [], false, false);
+      setServiceLLMs(vendorServiceId, [], true, false);
     }
     setIsLoading(false);
 
-  }, [localValue, providerSettingsKey, providerVendor, valueName]);
+  }, [localValue, onUnsavedChange, providerOmit, providerSettingsKey, providerVendor, valueName]);
 
 
   // memoed components
@@ -180,11 +208,12 @@ function WizardProviderSetup(props: {
       {/*</TooltipOutlined>*/}
       {/*<TooltipOutlined title='Confirm'>*/}
       <Button
-        variant='solid' color='primary'
+        color='primary'
+        variant='solid'
         onClick={handleSetServiceKeyValue}
         // endDecorator={<CheckRoundedIcon />}
       >
-        {!serviceKeyValue ? 'Confirm' : !localValue?.trim() ? 'Clear' : 'Update'}
+        {!serviceKeyValue ? 'Save' : !localValue?.trim() ? 'Delete' : 'Update'}
       </Button>
       {/*</TooltipOutlined>*/}
     </Box>
@@ -213,36 +242,26 @@ function WizardProviderSetup(props: {
             slotProps={{ badge: { sx: { boxShadow: 'xs', border: 'none' } } }}
           >
             <Avatar sx={{ height: '100%', aspectRatio: 1, backgroundColor: 'transparent' }}>
-              {isLoading ? <CircularProgress color='primary' variant='solid' size='sm' /> : <LLMVendorIcon vendorId={providerVendor.id} />}
+              {isLoading ? <CircularProgress color='primary' variant='solid' size='sm' /> : <LLMVendorIconSprite vendorId={providerVendor.id} />}
             </Avatar>
           </Badge>
         </TooltipOutlined>
 
         {/* Main key inputs */}
-        <Box sx={{ flex: 1, display: 'grid' }}>
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'row', gap: 0.5 }}>
 
-          {/* Line 1 */}
-          {/*{!!props.serviceLabel && (*/}
-          {/*  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>*/}
-          {/*    /!*<props.vendorIcon />*!/*/}
-          {/*    <Box>{props.serviceLabel}</Box>*/}
-          {/*  </Box>*/}
-          {/*)}*/}
+          <Box sx={{ flex: 1 }}>
+            <FormInputKey
+              noKey={isLocal}
+              autoCompleteId={autoCompleteId}
+              value={localValue ?? ''}
+              placeholder={`${vendorName} ${valueName}`}
+              onChange={handleLocalValueChange}
+              required={false}
+            />
+          </Box>
 
-          {/* Line 2 */}
-          <Input
-            fullWidth
-            name={`wizard-settings-value-${providerVendor.id}`}
-            autoComplete='off'
-            variant='outlined'
-            value={localValue ?? ''}
-            onChange={handleTextChanged}
-            placeholder={`${vendorName} ${valueName}`}
-            type={isLocal ? undefined : 'password'}
-            // error={!isValidKey}
-            // startDecorator={<props.vendorIcon />}
-            endDecorator={endButtons}
-          />
+          {endButtons}
 
         </Box>
 
@@ -266,6 +285,8 @@ export function ModelsWizard(props: {
   isMobile: boolean,
   onSkip?: () => void,
   onSwitchToAdvanced?: () => void,
+  onSwitchToWhy?: () => void,
+  onProviderUnsavedChange: (providerId: string, hasUnsaved: boolean) => void,
 }) {
 
   // state
@@ -286,7 +307,7 @@ export function ModelsWizard(props: {
           <Chip variant={isLocal ? 'solid' : 'outlined'} sx={{ mx: 0.25 }} onClick={() => setActiveCategory('local')}>
             Local
           </Chip>
-          {' '}AI services below.
+          {' '}<Box component='a' onClick={props.onSwitchToWhy} sx={{ color: 'text.tertiary', cursor: 'pointer' }}>AI services </Box> below.
         </Typography>
         {/*<Box sx={{ fontSize: 'sm', color: 'text.primary' }}>*/}
         {/*  Enter API keys to connect your AI services.{' '}*/}
@@ -300,6 +321,7 @@ export function ModelsWizard(props: {
           provider={provider}
           isFirst={!index}
           isHidden={provider.cat !== activeCategory}
+          onUnsavedChange={props.onProviderUnsavedChange}
         />
       ))}
 

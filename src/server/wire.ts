@@ -1,5 +1,10 @@
+import * as z from 'zod/v4';
+
+import { objectDeepCloneWithStringLimit } from '~/common/util/objectUtils';
+
+
 /// set this to true to see the tRPC and fetch requests made by the server
-export const SERVER_DEBUG_WIRE = false; //
+export const SERVER_DEBUG_WIRE = false;
 
 
 export class ServerFetchError extends Error {
@@ -51,10 +56,14 @@ export function safeErrorString(error: any): string | null {
     return null;
 
   // handle AggregateError
-  if (error instanceof AggregateError) {
-    const errors = error.errors.map(e => safeErrorString(e)).filter(Boolean);
+  if ((error instanceof AggregateError || error?.name === 'AggregateError') && Array.isArray(error.errors)) {
+    const errors = error.errors?.map((e: any) => safeErrorString(e)).filter(Boolean);
     return `AggregateError: ${errors.join('; ')}`;
   }
+
+  // handle zod v4 errors
+  if (error instanceof z.ZodError)
+    return z.prettifyError(error);
 
   // descend into an 'error' object
   if (error.error)
@@ -68,6 +77,15 @@ export function safeErrorString(error: any): string | null {
   }
   if (typeof error === 'string')
     return error;
+
+  // for real 'Error' objects, use the normal toString, as the JSON stringify may ignore fields for some reason
+  try {
+    if (error instanceof Error && 'toString' in error && typeof error.toString === 'function')
+      return error.toString();
+  } catch (e) {
+    // ignore
+  }
+
   if (typeof error === 'object') {
     try {
       return JSON.stringify(error, null, 2).slice(1, -1);
@@ -106,7 +124,7 @@ export function debugGenerateCurlCommand(method: 'GET' | 'POST' | 'DELETE' | 'PU
         }
       }
     } else
-      curl += `-d '${JSON.stringify(body)}'`;
+      curl += `-d '${JSON.stringify(objectDeepCloneWithStringLimit(body, 'debug-curl-body', 4096))}'`;
   }
 
   return curl;
@@ -120,25 +138,64 @@ export function createEmptyReadableStream<T = Uint8Array>(): ReadableStream<T> {
 
 
 /**
- * Small debugging utility to log train of events, used on the server-side
- * for incoming packets (e.g. SSE).
+ * Used in retry logic to wait between attempts while respecting abort signals.
+ * @returns True if aborted, false if completed normally
  */
-export class ServerDebugWireEvents {
-  private sequenceNumber: number = 0;
-  private lastMs: number | null = null;
-
-  onMessage(message: any) {
-    this.sequenceNumber++;
-    if (SERVER_DEBUG_WIRE) {
-      const nowMs = Date.now();
-      const elapsedMs = this.lastMs ? nowMs - this.lastMs : 0;
-      this.lastMs = nowMs;
-      console.log(`<- SSE (${this.sequenceNumber}, ${elapsedMs} ms):`, message);
+export function abortableDelay(delayMs: number, abortSignal: AbortSignal): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    // pre-check: already aborted or invalid delay
+    if (abortSignal.aborted || delayMs <= 0) {
+      resolve(abortSignal.aborted);
+      return;
     }
-  }
+
+    const timer = setTimeout(() => resolve(false), delayMs);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
-export const createServerDebugWireEvents = () => SERVER_DEBUG_WIRE ? new ServerDebugWireEvents() : null;
+
+/**
+ * Debugging utility for logging network I/O with sequence tracking and timing.
+ * Used for both server-side and client-side (via CSF) wire debugging.
+ *
+ * Usage:
+ *  - Server: const wire = createDebugWireLogger('AIX', SERVER_DEBUG_WIRE);
+ *  - Client: const wire = null; // explicitly disabled
+ *  - Access: wire?.logRequest(...); wire?.logResponse(...);
+ */
+export class DebugWireLogger {
+  private sequenceNumber: number = 0;
+  private lastMs: number | null = null;
+  private readonly distinct: string = Date.now().toString(36).slice(-4);
+
+  constructor(private readonly label: string) {}
+
+  logRequest(method: 'GET' | 'POST' | 'DELETE' | 'PUT', url: string, headers?: HeadersInit, body?: object) {
+    console.log(`\n[${this.label}:${this.distinct}] ->`, debugGenerateCurlCommand(method, url, headers, body));
+  }
+
+  logResponse(data: any) {
+    this.sequenceNumber++;
+    const nowMs = Date.now();
+    const elapsedMs = this.lastMs ? nowMs - this.lastMs : 0;
+    this.lastMs = nowMs;
+    console.log(
+      `\n[${this.label}:${this.distinct}] <- #${this.sequenceNumber} (${elapsedMs} ms):`,
+      objectDeepCloneWithStringLimit(data, `${this.label}.wire-debug`, 8192),
+      // JSON.stringify(objectDeepCloneWithStringLimit(data, `${this.label}.wire-debug`, 8192), null, 2),
+    );
+  }
+
+}
+
+export const createDebugWireLogger = (label: string) => SERVER_DEBUG_WIRE ? new DebugWireLogger(label) : null;
 
 
 /** Utility to escape XML, for example to avoid XSS attacks. */

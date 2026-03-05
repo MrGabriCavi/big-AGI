@@ -1,3 +1,5 @@
+import * as z from 'zod/v4';
+
 import type { AixAPI_Model, AixAPIChatGenerate_Request, AixMessages_ChatMessage, AixParts_DocPart, AixTools_ToolDefinition, AixTools_ToolsPolicy } from '../../../api/aix.wiretypes';
 import { GeminiWire_API_Generate_Content, GeminiWire_ContentParts, GeminiWire_Messages, GeminiWire_Safety, GeminiWire_ToolDeclarations } from '../../wiretypes/gemini.wiretypes';
 
@@ -8,10 +10,25 @@ import { aixSpillSystemToUser, approxDocPart_To_String, approxInReferenceTo_To_X
 const hotFixImagePartsFirst = true; // https://ai.google.dev/gemini-api/docs/image-understanding#tips-best-practices
 const hotFixReplaceEmptyMessagesWithEmptyTextPart = true;
 
+// [Gemini 3, 2025-11-20] Bypass dummy thoughtSignature for Gemini 3+ validation
+// https://ai.google.dev/gemini-api/docs/thought-signatures
+const GEMINI_BYPASS_THOUGHT_SIGNATURE = 'context_engineering_is_the_way_to_go';
+const MODELS_REQUIRING_THOUGHT_SIGNATURE = [
+  'nano-banana-pro',
+  // preview, e.g.:
+  // 'gemini-3.1-flash-image-preview',
+  // 'gemini-3-pro-image-preview',
+  '-image-preview', // catch-all for image (nano banana) preview models
+] as const;
+
 
 export function aixToGeminiGenerateContent(model: AixAPI_Model, _chatGenerate: AixAPIChatGenerate_Request, geminiSafetyThreshold: GeminiWire_Safety.HarmBlockThreshold, jsonOutput: boolean, _streaming: boolean): TRequest {
 
-  // Note: the streaming setting is ignored as it only belongs in the path
+  // Hotfixes - reduce these to the minimum, as they shall be higher-level resolved
+  const isFamilyNanoBanana = MODELS_REQUIRING_THOUGHT_SIGNATURE.some(m => model.id.includes(m));
+  const api3RequiresSignatures = isFamilyNanoBanana;
+
+  // Note: the streaming setting is ignored here as it only belongs in the path
 
   // Pre-process CGR - approximate spill of System to User message - note: no need to flush as every message is not batched
   const chatGenerate = aixSpillSystemToUser(_chatGenerate);
@@ -51,19 +68,22 @@ export function aixToGeminiGenerateContent(model: AixAPI_Model, _chatGenerate: A
   }
 
   // Chat Messages
-  const contents: TRequest['contents'] = _toGeminiContents(chatGenerate.chatSequence);
+  const contents: TRequest['contents'] = _toGeminiContents(chatGenerate.chatSequence, api3RequiresSignatures);
+
+  // constrained output modes - only JSON (not tool invocations for now)
+  const jsonOutputEnabled = !!model.strictJsonOutput || jsonOutput;
+  const jsonOutputSchema = model.strictJsonOutput?.schema;
+  // const strictToolInvocation = model.strictToolInvocations; // Gemini does not seem to support this yet - need to confirm
 
   // Construct the request payload
   const payload: TRequest = {
     contents,
-    tools: chatGenerate.tools && _toGeminiTools(chatGenerate.tools),
-    toolConfig: chatGenerate.toolsPolicy && _toGeminiToolConfig(chatGenerate.toolsPolicy),
     safetySettings: _toGeminiSafetySettings(geminiSafetyThreshold),
     systemInstruction,
     generationConfig: {
       stopSequences: undefined, // (default, optional)
-      responseMimeType: jsonOutput ? 'application/json' : undefined,
-      responseSchema: undefined, // (default, optional) NOTE: for JSON output, we'd take the schema here
+      responseMimeType: jsonOutputEnabled ? 'application/json' : undefined,
+      responseSchema: jsonOutputSchema,
       candidateCount: undefined, // (default, optional)
       maxOutputTokens: model.maxTokens !== undefined ? model.maxTokens : undefined,
       ...(model.temperature !== null ? { temperature: model.temperature !== undefined ? model.temperature : undefined } : {}),
@@ -79,21 +99,50 @@ export function aixToGeminiGenerateContent(model: AixAPI_Model, _chatGenerate: A
   }
 
   // Thinking models: thinking budget and show thoughts
-  if (model.vndGeminiShowThoughts === true || model.vndGeminiThinkingBudget !== undefined) {
+  const thinkingLevel = model.reasoningEffort; // ?? model.vndGeminiThinkingLevel;
+  if (thinkingLevel === 'none' || thinkingLevel === 'xhigh' || thinkingLevel === 'max') // domain validation
+    throw new Error(`Gemini API does not support '${thinkingLevel}' thinking level`);
+
+  if (thinkingLevel || model.vndGeminiThinkingBudget !== undefined /*|| model.vndGeminiShowThoughts === true*/) {
     const thinkingConfig: Exclude<TRequest['generationConfig'], undefined>['thinkingConfig'] = {};
 
-    // This seems deprecated keep it in case Gemini turns it on again
-    if (model.vndGeminiShowThoughts)
+    // This shows mainly 'summaries' of thoughts, and we enable it for most cases where thinking is requested
+    if (thinkingLevel || (model.vndGeminiThinkingBudget ?? 0) > 1 /*|| model.vndGeminiShowThoughts === true*/)
       thinkingConfig.includeThoughts = true;
 
-    // 0 disables thinking explicitly
-    if (model.vndGeminiThinkingBudget !== undefined) {
+    // [Gemini 3, 2025-11-18] Thinking Level (replaces thinkingBudget for Gemini 3)
+    // CRITICAL: Cannot use both thinkingLevel and thinkingBudget (400 error)
+    if (thinkingLevel) {
+      // - Gemini 3 Flash: supports 'high', 'medium', 'low', 'minimal'
+      // - Gemini 3 Pro: supports 'high', 'low'
+      thinkingConfig.thinkingLevel = thinkingLevel;
+    }
+    // [Gemini 2.x] Thinking Budget (0 disables thinking explicitly) - mutually exclusive with thinkingLevel
+    else if (model.vndGeminiThinkingBudget !== undefined) {
       if (model.vndGeminiThinkingBudget > 0)
         thinkingConfig.includeThoughts = true;
       thinkingConfig.thinkingBudget = model.vndGeminiThinkingBudget;
     }
 
     payload.generationConfig!.thinkingConfig = thinkingConfig;
+  }
+
+  // [Gemini, 2025-11-18] Media Resolution: controls vision processing quality
+  if (model.vndGeminiMediaResolution) {
+    const mediaResolutionValuesMap = {
+      'mr_low': 'MEDIA_RESOLUTION_LOW',
+      'mr_medium': 'MEDIA_RESOLUTION_MEDIUM',
+      'mr_high': 'MEDIA_RESOLUTION_HIGH',
+    } as const;
+    payload.generationConfig!.mediaResolution = mediaResolutionValuesMap[model.vndGeminiMediaResolution];
+  }
+
+  // [Gemini, 2025-10-02] [Gemini, 2025-11-20] Image generation: aspect ratio and size configuration
+  if (model.vndGeminiAspectRatio || model.vndGeminiImageSize) {
+    payload.generationConfig!.imageConfig = {
+      ...(model.vndGeminiAspectRatio ? { aspectRatio: model.vndGeminiAspectRatio } : {}),
+      ...(model.vndGeminiImageSize ? { imageSize: model.vndGeminiImageSize } : {}),
+    };
   }
 
   // [Gemini, 2025-05-20] Experimental Audio generation (TTS - audio only, no text): Request
@@ -124,17 +173,83 @@ export function aixToGeminiGenerateContent(model: AixAPI_Model, _chatGenerate: A
     // payload.generationConfig!.mediaResolution = 'MEDIA_RESOLUTION_HIGH';
   }
 
-  // TODO: Google Search Grounding: for the models that support it, it shall be declared and runtime toggleable
-  // it then becomes just a metter of:
-  // - payload.tools = [...payload.tools, { googleSearch: {} }]; -- for most models
-  // - emitting the missing particles, parsing, rendering
-  // - working around the limitations and idiosyncrasies of the Search API
+
+  // --- Tools ---
+
+  // Allow/deny auto-adding hosted tools when custom tools are present
+  const hasCustomTools = chatGenerate.tools?.some(t => t.type === 'function_call');
+  const hasRestrictivePolicy = chatGenerate.toolsPolicy?.type === 'any' || chatGenerate.toolsPolicy?.type === 'function_call';
+  const skipHostedToolsDueToCustomTools = hasCustomTools && hasRestrictivePolicy; // FIXME: re-evaluate in the future whether this shall be on higher information levels (callers)
+
+  // Function Calls (Custom Tools)
+  if (chatGenerate.tools) {
+    payload.tools = _toGeminiTools(chatGenerate.tools);
+    if (chatGenerate.toolsPolicy)
+      payload.toolConfig = _toGeminiToolConfig(chatGenerate.toolsPolicy);
+  }
+
+  // Hosted tools
+
+  // [Gemini, 2025-11-18] Code Execution: add tool when enabled
+  if (model.vndGeminiCodeExecution === 'auto' && !skipHostedToolsDueToCustomTools) {
+    if (!payload.tools) payload.tools = [];
+
+    // Build the Code Execution tool configuration (empty object)
+    const codeExecutionTool: NonNullable<TRequest['tools']>[number] = {
+      codeExecution: {},
+    };
+
+    // Add to tools array
+    payload.tools.push(codeExecutionTool);
+  }
+
+  // [Gemini, 2025-11-01] Computer Use: add tool when environment is specified
+  if (model.vndGeminiComputerUse && !skipHostedToolsDueToCustomTools) {
+    if (!payload.tools) payload.tools = [];
+
+    // Build the Computer Use tool configuration
+    const computerUseTool: NonNullable<TRequest['tools']>[number] = {
+      computerUse: {
+        environment: model.vndGeminiComputerUse === 'browser' ? 'ENVIRONMENT_BROWSER' : 'ENVIRONMENT_BROWSER',
+      },
+    };
+
+    // Add to tools array
+    payload.tools.push(computerUseTool);
+  }
+
+  // [Gemini, 2025-10-13] Google Search Grounding: add tool when enabled
+  if (model.vndGeminiGoogleSearch && !skipHostedToolsDueToCustomTools) {
+    if (!payload.tools) payload.tools = [];
+
+    // Build the Google Search tool configuration
+    const googleSearchTool: NonNullable<TRequest['tools']>[number] = {
+      googleSearch: _buildGoogleSearchConfig(model.vndGeminiGoogleSearch),
+    };
+
+    // Add to tools array
+    payload.tools.push(googleSearchTool);
+  }
+
+  // [Gemini, 2025-08-18] URL Context: add tool when enabled
+  const disableUrlContext = isFamilyNanoBanana /* Nano Bananas don't fetch */ || skipHostedToolsDueToCustomTools;
+  if (model.vndGeminiUrlContext === 'auto' && !disableUrlContext) {
+    if (!payload.tools) payload.tools = [];
+
+    // Build the URL Context tool configuration (empty object)
+    const urlContextTool: NonNullable<TRequest['tools']>[number] = {
+      urlContext: {},
+    };
+
+    // Add to tools array
+    payload.tools.push(urlContextTool);
+  }
 
   // Preemptive error detection with server-side payload validation before sending it upstream
   const validated = GeminiWire_API_Generate_Content.Request_schema.safeParse(payload);
   if (!validated.success) {
-    console.warn('Gemini: invalid generateContent payload. Error:', validated.error.message);
-    throw new Error(`Invalid sequence for Gemini models: ${validated.error.issues?.[0]?.message || validated.error.message || validated.error}.`);
+    console.warn('[DEV] Gemini: invalid generateContent payload. Error:', { valError: validated.error });
+    throw new Error(`Invalid request for Gemini models: ${z.prettifyError(validated.error)}`);
   }
 
   return validated.data;
@@ -143,7 +258,7 @@ export function aixToGeminiGenerateContent(model: AixAPI_Model, _chatGenerate: A
 type TRequest = GeminiWire_API_Generate_Content.Request;
 
 
-function _toGeminiContents(chatSequence: AixMessages_ChatMessage[]): GeminiWire_Messages.Content[] {
+function _toGeminiContents(chatSequence: AixMessages_ChatMessage[], apiRequiresSignatures: boolean): GeminiWire_Messages.Content[] {
 
   // Remove messages that are made of empty parts
   // if (hotFixRemoveEmptyMessages)
@@ -172,15 +287,22 @@ function _toGeminiContents(chatSequence: AixMessages_ChatMessage[]): GeminiWire_
     }
 
     for (const part of message.parts) {
+      let partRequiresSignature = false;
       switch (part.pt) {
 
         case 'text':
           parts.push(GeminiWire_ContentParts.TextPart(part.text));
+
+          // [Gemini, 2025-11-20] Nano Banana Pro requires thoughtSignature on the first model text part
+          if (apiRequiresSignatures && message.role === 'model')
+            partRequiresSignature = true;
           break;
 
         case 'inline_audio':
         case 'inline_image':
           parts.push(GeminiWire_ContentParts.InlineDataPart(part.mimeType, part.base64));
+          if (apiRequiresSignatures)
+            partRequiresSignature = true;
           break;
 
         case 'doc':
@@ -271,6 +393,24 @@ function _toGeminiContents(chatSequence: AixMessages_ChatMessage[]): GeminiWire_
           const _exhaustiveCheck: never = part;
           throw new Error(`Unsupported part type in Chat message: ${(part as any).pt}`);
       }
+
+      // apply thoughtSignature if present
+      if (parts.length) {
+        const tsTarget = parts[parts.length - 1];
+
+        // apply thoughtSignature to the last part if applicable
+        if ('_vnd' in part && part._vnd?.gemini?.thoughtSignature) {
+          tsTarget.thoughtSignature = part._vnd.gemini.thoughtSignature;
+        }
+        // if not applied yet, and required for this part type, apply bypass dummy and warn
+        else if (partRequiresSignature) {
+          // Without this, images that are generated by other (non-signed) models/tools will cause errors:
+          // << [Service Issue] Gemini: Upstream responded with HTTP 400 Bad Request - Image part is missing a thought_signature in content position 12, part position 1. Please refer to https://ai.google.dev/gemini-api/docs/thought-signatures#model-behavior for more details. >>
+          tsTarget.thoughtSignature = GEMINI_BYPASS_THOUGHT_SIGNATURE;
+          // [Gemini 3, 2025-11-20] Cross-provider or edited content warning
+          console.log(`[Gemini 3] ${part.pt} missing thoughtSignature - bypass applied`);
+        }
+      }
     }
 
     return {
@@ -320,8 +460,9 @@ function _toGeminiTools(itds: AixTools_ToolDefinition[]): NonNullable<TRequest['
         break;
 
       case 'code_execution':
-        if (itd.variant !== 'gemini_auto_inline')
-          throw new Error('Gemini only supports inline code execution');
+        // NOTE: commented because now we have 'code_interpreter' too
+        // if (itd.variant !== 'gemini_auto_inline')
+        //   throw new Error('Gemini only supports inline code execution');
 
         // throw if code execution is present more than once
         if (tools.some(tool => tool.codeExecution))
@@ -334,6 +475,9 @@ function _toGeminiTools(itds: AixTools_ToolDefinition[]): NonNullable<TRequest['
           },
         });
         break;
+
+      default: // Note: Gemini's tool function doesn't break on unknown tools, so we need the default case here
+        throw new Error('Tool ${itd.type} is not supported by Gemini');
 
     }
   });
@@ -373,4 +517,44 @@ function _toGeminiSafetySettings(threshold: GeminiWire_Safety.HarmBlockThreshold
 function _toApproximateGeminiDocPart(aixPartsDocPart: AixParts_DocPart): GeminiWire_ContentParts.ContentPart {
   // NOTE: we keep this function because we could use Gemini's different way to represent documents in the future...
   return GeminiWire_ContentParts.TextPart(approxDocPart_To_String(aixPartsDocPart));
+}
+
+function _buildGoogleSearchConfig(searchGrounding: AixAPI_Model['vndGeminiGoogleSearch']): NonNullable<NonNullable<TRequest['tools']>[number]['googleSearch']> {
+
+  // enabled: any time interval
+  if (searchGrounding === 'unfiltered')
+    return {};
+
+  // calculate the time range based on the filter value
+  const until = new Date();
+  const startTime = new Date(until);
+  switch (searchGrounding) {
+    case '1d':
+      startTime.setDate(until.getDate() - 1);
+      // Fix "Invalid time range: end_time must be 24 hours after start_time."
+      until.setHours(until.getHours() + 1);
+      break;
+    case '1w':
+      startTime.setDate(until.getDate() - 7);
+      break;
+    case '1m':
+      startTime.setMonth(until.getMonth() - 1);
+      break;
+    case '6m':
+      startTime.setMonth(until.getMonth() - 6);
+      break;
+    case '1y':
+      startTime.setFullYear(until.getFullYear() - 1);
+      break;
+    default:
+      console.warn(`Unknown Google Search grounding value: ${searchGrounding}`);
+      return {};
+  }
+  // format timestamps: https://ai.google.dev/api/caching#Interval
+  return {
+    timeRangeFilter: {
+      startTime: startTime.toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      endTime: until.toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    },
+  };
 }

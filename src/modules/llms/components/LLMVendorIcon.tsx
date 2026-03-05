@@ -12,12 +12,14 @@ import { PhRobot } from '~/common/components/icons/phosphor/PhRobot';
 import { AlibabaCloudIcon } from '~/common/components/icons/vendors/AlibabaCloudIcon';
 import { AnthropicIcon } from '~/common/components/icons/vendors/AnthropicIcon';
 import { AzureIcon } from '~/common/components/icons/vendors/AzureIcon';
+import { BedrockIcon } from '~/common/components/icons/vendors/BedrockIcon';
 import { DeepseekIcon } from '~/common/components/icons/vendors/DeepseekIcon';
 import { GeminiIcon } from '~/common/components/icons/vendors/GeminiIcon';
 import { GroqIcon } from '~/common/components/icons/vendors/GroqIcon';
 import { LMStudioIcon } from '~/common/components/icons/vendors/LMStudioIcon';
 import { LocalAIIcon } from '~/common/components/icons/vendors/LocalAIIcon';
 import { MistralIcon } from '~/common/components/icons/vendors/MistralIcon';
+import { MoonshotIcon } from '~/common/components/icons/vendors/MoonshotIcon';
 import { OllamaIcon } from '~/common/components/icons/vendors/OllamaIcon';
 import { OpenAIIcon } from '~/common/components/icons/vendors/OpenAIIcon';
 import { OpenPipeIcon } from '~/common/components/icons/vendors/OpenPipeIcon';
@@ -25,6 +27,7 @@ import { OpenRouterIcon } from '~/common/components/icons/vendors/OpenRouterIcon
 import { PerplexityIcon } from '~/common/components/icons/vendors/PerplexityIcon';
 import { TogetherIcon } from '~/common/components/icons/vendors/TogetherIcon';
 import { XAIIcon } from '~/common/components/icons/vendors/XAIIcon';
+import { ZAIIcon } from '~/common/components/icons/vendors/ZAIIcon';
 
 
 /**
@@ -36,12 +39,14 @@ const vendorIcons: Record<ModelVendorId, React.FunctionComponent<SvgIconProps>> 
   alibaba: AlibabaCloudIcon,
   anthropic: AnthropicIcon,
   azure: AzureIcon,
+  bedrock: BedrockIcon,
   deepseek: DeepseekIcon,
   googleai: GeminiIcon,
   groq: GroqIcon,
   lmstudio: LMStudioIcon,
   localai: LocalAIIcon,
   mistral: MistralIcon,
+  moonshot: MoonshotIcon,
   ollama: OllamaIcon,
   openai: OpenAIIcon,
   openpipe: OpenPipeIcon,
@@ -49,6 +54,7 @@ const vendorIcons: Record<ModelVendorId, React.FunctionComponent<SvgIconProps>> 
   perplexity: PerplexityIcon,
   togetherai: TogetherIcon,
   xai: XAIIcon,
+  zai: ZAIIcon,
 };
 
 

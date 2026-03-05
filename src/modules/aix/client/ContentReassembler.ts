@@ -1,14 +1,13 @@
 import { addDBImageAsset } from '~/common/stores/blob/dblobs-portability';
 
+import type { DMessageGenerator } from '~/common/stores/chat/chat.message';
 import type { MaybePromise } from '~/common/types/useful.types';
-import { DEFAULT_ADRAFT_IMAGE_MIMETYPE } from '~/common/attachment-drafts/attachment.pipeline';
 import { convert_Base64WithMimeType_To_Blob } from '~/common/util/blobUtils';
-import { create_CodeExecutionInvocation_ContentFragment, create_CodeExecutionResponse_ContentFragment, create_FunctionCallInvocation_ContentFragment, createAnnotationsVoidFragment, createDMessageDataRefDBlob, createDVoidWebCitation, createErrorContentFragment, createModelAuxVoidFragment, createTextContentFragment, createZyncAssetReferenceContentFragment, DVoidModelAuxPart, isContentFragment, isModelAuxPart, isTextContentFragment, isVoidAnnotationsFragment, isVoidFragment } from '~/common/stores/chat/chat.fragments';
+import { create_CodeExecutionInvocation_ContentFragment, create_CodeExecutionResponse_ContentFragment, create_FunctionCallInvocation_ContentFragment, createAnnotationsVoidFragment, createDMessageDataRefDBlob, createDVoidWebCitation, createErrorContentFragment, createModelAuxVoidFragment, createPlaceholderVoidFragment, createTextContentFragment, createZyncAssetReferenceContentFragment, DMessageErrorPart, DVoidModelAuxPart, DVoidPlaceholderModelOp, isContentFragment, isModelAuxPart, isTextContentFragment, isVoidAnnotationsFragment, isVoidFragment } from '~/common/stores/chat/chat.fragments';
 import { ellipsizeMiddle } from '~/common/util/textUtils';
-import { imageBlobTransform } from '~/common/util/imageUtils';
+import { imageBlobTransform, PLATFORM_IMAGE_MIMETYPE } from '~/common/util/imageUtils';
 import { metricsFinishChatGenerateLg, metricsPendChatGenerateLg } from '~/common/stores/metrics/metrics.chatgenerate';
 import { nanoidToUuidV4 } from '~/common/util/idUtils';
-import { presentErrorToHumans } from '~/common/util/errorUtils';
 
 import type { AixWire_Particles } from '../server/api/aix.wiretypes';
 
@@ -16,14 +15,14 @@ import type { AixClientDebugger, AixFrameId } from './debugger/memstore-aix-clie
 import { aixClientDebugger_completeFrame, aixClientDebugger_init, aixClientDebugger_recordParticleReceived, aixClientDebugger_setProfilerMeasurements, aixClientDebugger_setRequest } from './debugger/reassembler-debug';
 
 import { AixChatGenerateContent_LL, DEBUG_PARTICLES } from './aix.client';
+import { aixClassifyReassemblyError } from './aix.client.errors';
 
 
 // configuration
 const GENERATED_IMAGES_CONVERT_TO_COMPRESSED = true; // converts PNG to WebP or JPEG to save IndexedDB space
 const GENERATED_IMAGES_COMPRESSION_QUALITY = 0.98;
 const ELLIPSIZE_DEV_ISSUE_MESSAGES = 4096;
-const MERGE_ISSUES_INTO_TEXT_PART_IF_OPEN = true;
-const DEBUG_LOG_PROFILER_ON_CLIENT = false; // print Profiling particles when they come in, otherwise ignore them
+const MERGE_ISSUES_INTO_TEXT_PART_IF_OPEN = false; // 2025-10-10: put errors in the dedicated part
 
 
 /**
@@ -43,16 +42,21 @@ export class ContentReassembler {
   // reassembly state (plus the ext. accumulator)
   private currentTextFragmentIndex: number | null = null;
 
+  // raw termination data (set during stream or by client, classified at finalization)
+  private _terminationReason?: 'done-client-aborted' | 'issue-client-rpc' | AixWire_Particles.CGEndReason;
+  private _tokenStopReasonWire?: AixWire_Particles.GCTokenStopReason;
+
 
   constructor(
     private readonly accumulator: AixChatGenerateContent_LL,
     private readonly onAccumulatorUpdated?: () => MaybePromise<void>,
-    enableDebugContext?: AixClientDebugger.Context,
+    inspectorTransport?: AixClientDebugger.Transport,
+    inspectorContext?: AixClientDebugger.Context,
     private readonly wireAbortSignal?: AbortSignal,
   ) {
 
     // [SUDO] Debugging the request, last-write-wins for the global (displayed in the UI)
-    this.debuggerFrameId = !enableDebugContext ? null : aixClientDebugger_init(enableDebugContext);
+    this.debuggerFrameId = !inspectorContext ? null : aixClientDebugger_init(inspectorTransport ?? 'trpc', inspectorContext);
 
   }
 
@@ -61,7 +65,11 @@ export class ContentReassembler {
 
   enqueueWireParticle(op: AixWire_Particles.ChatGenerateOp): void {
     if (this.#wireIsAborted) {
-      // console.log('Dropped particle due to abort:', op);
+      // WARN about dropping particles; note that this should not happen besides CSF 'end' particles,
+      //      which are ignored anyways becuse we hande end with the '.throwIfAborted()' outside here
+      const isEndParticle = 'cg' in op && op.cg === 'end';
+      if (!isEndParticle)
+        console.log('⚠️ [ContentReassembler] enqueueWireParticle: received particle after wire abortion, ignoring', op);
       return;
     }
 
@@ -81,9 +89,12 @@ export class ContentReassembler {
 
   finalizeAccumulator(): void {
 
-    // Perform all the latest operations
-    const hasAborted = !!this.accumulator.genTokenStopReason;
-    metricsFinishChatGenerateLg(this.accumulator.genMetricsLg, hasAborted);
+    // Classify termination
+    this.accumulator.legacyGenTokenStopReason = this._deriveTokenStopReason();
+
+    // Metrics
+    const hadIssues = !!this.accumulator.legacyGenTokenStopReason;
+    metricsFinishChatGenerateLg(this.accumulator.genMetricsLg, hadIssues);
 
     // [SUDO] Debugging, finalize the frame
     if (this.debuggerFrameId)
@@ -92,22 +103,44 @@ export class ContentReassembler {
   }
 
 
-  async setClientAborted(): Promise<void> {
+  setClientAborted(): void {
     if (DEBUG_PARTICLES)
       console.log('-> aix.p: abort-client');
 
-    // NOTE: this doens't go to the debugger anymore - as we only publish external particles to the debugger
-    await this.#reassembleParticle({ cg: 'end', reason: 'abort-client', tokenStopReason: 'client-abort-signal' });
+    // normal user cancellation does not require error fragments
+
+    if (this._terminationReason)
+      console.warn(`⚠️ [ContentReassembler] setClientAborted: overriding server termination '${this._terminationReason}' (wire stop: ${this._tokenStopReasonWire ?? 'none'})`);
+
+    this._terminationReason = 'done-client-aborted';
+    this._tokenStopReasonWire = undefined; // reset, as we assume we can't know (alt: jsut leave it)
   }
 
-  async setClientExcepted(errorAsText: string): Promise<void> {
+  setClientExcepted(errorAsText: string, errorHint?: DMessageErrorPart['hint']): void {
     if (DEBUG_PARTICLES)
       console.log('-> aix.p: issue:', errorAsText);
 
-    this.onCGIssue({ cg: 'issue', issueId: 'client-read', issueText: errorAsText });
+    // add the error fragment with the given message
+    this._appendErrorFragment(errorAsText, errorHint);
 
-    // NOTE: this doens't go to the debugger anymore - as we only publish external particles to the debugger
-    await this.#reassembleParticle({ cg: 'end', reason: 'issue-rpc', tokenStopReason: 'cg-issue' });
+    if (this._terminationReason)
+      console.warn(`⚠️ [ContentReassembler] setClientExcepted: overriding server termination '${this._terminationReason}' (wire stop: ${this._tokenStopReasonWire ?? 'none'})`);
+
+    this._terminationReason = 'issue-client-rpc';
+    this._tokenStopReasonWire = undefined; // reset, as we can't assume we know (alt: jsut leave it)
+  }
+
+  async setClientRetrying(strategy: 'reconnect' | 'resume', errorMessage: string, attempt: number, maxAttempts: number, delayMs: number, causeHttp?: number, causeConn?: string) {
+    if (DEBUG_PARTICLES)
+      console.log(`-> aix.p: client-retry (${strategy})`, { errorMessage, attempt, maxAttempts, delayMs, causeHttp, causeConn });
+
+    // process as retry-reset with cli-ll scope
+    this.onRetryReset({
+      cg: 'retry-reset', rScope: 'cli-ll',
+      rShallClear: false, // TODO: check if this is correct; we shall clear, but at the same time we haven't tried to see
+      reason: strategy === 'resume' ? `Resuming - ${errorMessage}` : `Reconnecting - ${errorMessage}`,
+      attempt, maxAttempts, delayMs, causeHttp, causeConn,
+    });
   }
 
 
@@ -149,25 +182,17 @@ export class ContentReassembler {
 
     } catch (error) {
 
-      // ERROR CATCHING - LIKE the _aixChatGenerateContent_LL which doesn't intercept this somehow
-      // NEW METHOD: shows Error Fragments on both Reassembly and Callbacks errors
       //
-      // - we don't stop processing anymore, as the source may still be pumping particles
-      // - we insert an error fragment showing what happened - akin to how _aixChatGenerateContent_LL would do it
+      // Classify and display processing errors (particle/async work failures)
+      //
+      // NOTE: we cannot throw here as we are part of a detached promise chain
+      // READ the `aixClassifyReassemblyError` that explains this in detail
       //
       const showAsBold = !!this.accumulator.fragments.length;
-      const errorText = (presentErrorToHumans(error, showAsBold, true) || 'Unknown error');
-      this._appendReassemblyDevError(`An unexpected issue occurred: ${errorText} Please retry.`, true);
+      const { errorMessage } = aixClassifyReassemblyError(error, showAsBold);
+
+      this._appendReassemblyDevError(errorMessage, true);
       await this.onAccumulatorUpdated?.()?.catch(console.error);
-
-      // FORMER METHOD - the THROW wasn't caught by the caller
-
-      // mark that we've encountered an error to prevent further scheduling
-      // this.hadErrorInWireReassembly = true;
-      // this.wireParticlesBacklog.length = 0; // empty the backlog
-
-      // te-throw to propagate to outer catch blocks
-      // throw error;
 
     } finally {
 
@@ -190,6 +215,11 @@ export class ContentReassembler {
   /// Particle Reassembly ///
 
   async #reassembleParticle(op: AixWire_Particles.ChatGenerateOp): Promise<void> {
+
+    // remove placeholder if any other content except heartbeat or void-placeholder
+    if (!('p' in op) || !(op.p === '❤' || op.p === 'vp'))
+      this.removePlaceholderIfAtIndex0();
+
     switch (true) {
 
       // TextParticleOp
@@ -230,8 +260,14 @@ export class ContentReassembler {
           case 'ii':
             await this.onAppendInlineImage(op);
             break;
+          case 'svs':
+            this.onSetVendorState(op);
+            break;
           case 'urlc':
             this.onAddUrlCitation(op);
+            break;
+          case 'vp':
+            this.onAppendVoidPlaceholder(op);
             break;
           default:
             // noinspection JSUnusedLocalSymbols
@@ -250,13 +286,6 @@ export class ContentReassembler {
           case '_debugProfiler':
             if (this.debuggerFrameId)
               aixClientDebugger_setProfilerMeasurements(this.debuggerFrameId, op.measurements);
-            // Profiling particles will come in if the app is in "Debug Mode" + it's a Development build!
-            // Additionally to show them on the console (rather than just in the debugger) set the
-            // constant to `true`.
-            if (DEBUG_LOG_PROFILER_ON_CLIENT) {
-              console.warn('[AIX] chatGenerate profiler measurements:');
-              console.table(op.measurements);
-            }
             break;
           case 'end':
             this.onCGEnd(op);
@@ -264,11 +293,20 @@ export class ContentReassembler {
           case 'issue':
             this.onCGIssue(op);
             break;
+          case 'retry-reset':
+            this.onRetryReset(op);
+            break;
           case 'set-metrics':
             this.onMetrics(op);
             break;
           case 'set-model':
             this.onModelName(op);
+            break;
+          case 'set-provider-infra':
+            this.onProviderInfra(op);
+            break;
+          case 'set-upstream-handle':
+            this.onResponseHandle(op);
             break;
           default:
             // noinspection JSUnusedLocalSymbols
@@ -304,13 +342,13 @@ export class ContentReassembler {
 
   }
 
-  private onAppendReasoningText({ _t /*, weak*/ }: Extract<AixWire_Particles.PartParticleOp, { p: 'tr_' }>): void {
+  private onAppendReasoningText({ _t, restart }: Extract<AixWire_Particles.PartParticleOp, { p: 'tr_' }>): void {
     // Break text accumulation
     this.currentTextFragmentIndex = null;
 
     // append to existing ModelAuxVoidFragment if possible
     const currentFragment = this.accumulator.fragments[this.accumulator.fragments.length - 1];
-    if (currentFragment && isVoidFragment(currentFragment) && isModelAuxPart(currentFragment.part)) {
+    if (!restart && currentFragment && isVoidFragment(currentFragment) && isModelAuxPart(currentFragment.part)) {
       const appendedPart = { ...currentFragment.part, aText: (currentFragment.part.aText || '') + _t } satisfies DVoidModelAuxPart;
       this.accumulator.fragments[this.accumulator.fragments.length - 1] = { ...currentFragment, part: appendedPart };
       return;
@@ -396,7 +434,7 @@ export class ContentReassembler {
     // Break text accumulation, as we have a full audio part in the middle
     this.currentTextFragmentIndex = null;
 
-    const { mimeType, a_b64: base64Data, label, generator, durationMs } = particle;
+    const { mimeType, a_b64: base64Data, label, /*generator,*/ durationMs } = particle;
     const safeLabel = label || 'Generated Audio';
 
     try {
@@ -425,7 +463,7 @@ export class ContentReassembler {
       });
 
       // TEMP: show a label instead of adding the model part
-      this.accumulator.fragments.push(createTextContentFragment(`Playing ${safeLabel}${durationMs ? ` (${Math.round(durationMs / 10) / 100}s)` : ''}`));
+      this.accumulator.fragments.push(createTextContentFragment(`Generated audio ▶ \`${safeLabel}\`${durationMs ? ` (${Math.round(durationMs / 10) / 100}s)` : ''}`));
 
       // Add the audio to the DBlobs DB
       // const dblobAssetId = await addDBAudioAsset('global', 'app-chat', {
@@ -468,7 +506,7 @@ export class ContentReassembler {
     } catch (error: any) {
       console.warn('[DEV] Failed to add inline audio to DBlobs:', { label: safeLabel, error, mimeType, size: base64Data.length });
       // Add an error fragment instead
-      this.accumulator.fragments.push(createErrorContentFragment(`Failed to process audio: ${error?.message || 'Unknown error'}`));
+      this._appendErrorFragment(`Failed to process audio: ${error?.message || 'Unknown error'}`, 'aix-audio-processing');
     }
   }
 
@@ -488,7 +526,7 @@ export class ContentReassembler {
       // perform resize/type conversion if desired, and find the image dimensions
       const shallConvert = GENERATED_IMAGES_CONVERT_TO_COMPRESSED && inputType === 'image/png';
       const { blob: imageBlob, height: imageHeight, width: imageWidth } = await imageBlobTransform(inputImage, {
-        convertToMimeType: shallConvert ? DEFAULT_ADRAFT_IMAGE_MIMETYPE : undefined,
+        convertToMimeType: shallConvert ? PLATFORM_IMAGE_MIMETYPE : undefined,
         convertToLossyQuality: GENERATED_IMAGES_COMPRESSION_QUALITY,
         throwOnTypeConversionError: true,
         debugConversionLabel: `ContentReassembler(ii)`,
@@ -524,7 +562,7 @@ export class ContentReassembler {
           ...(safeLabel ? { altText: safeLabel } : {}),
           ...(imageWidth ? { width: imageWidth } : {}),
           ...(imageHeight ? { height: imageHeight } : {}),
-        }
+        },
       );
 
       this.accumulator.fragments.push(zyncImageAssetFragmentWithLegacy);
@@ -569,62 +607,181 @@ export class ContentReassembler {
     // This ensures we don't interrupt the text flow
   }
 
+  private onAppendVoidPlaceholder(vp: Extract<AixWire_Particles.PartParticleOp, { p: 'vp' }>): void {
+    const { text, mot } = vp;
 
-  /// Rest of the data ///
+    // update the model op
+    const modelOp: DVoidPlaceholderModelOp = { mot, cts: Date.now() };
 
-  private onCGEnd({ reason: _reason /* Redundant: no information */, tokenStopReason }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'end' }>): void {
+    // Only reuse placeholder if it's at index 0
+    if (this.accumulator.fragments.length > 0) {
+      const firstFragment = this.accumulator.fragments[0];
+      if (firstFragment.ft === 'void' && firstFragment.part.pt === 'ph') {
+        // Update existing placeholder at index 0
+        firstFragment.part.pText = text;
+        firstFragment.part.modelOp = modelOp;
+        return;
+      }
+    }
 
-    // NOTE: no new info in particle.reason
-    // - abort-client: user abort (already captured in the stop reason)
-    // - done-*: normal termination (no info)
-    // - issue-*: issue (already captured in the 'issue' particle, and stop reason is 'cg-issue')
+    // Create new placeholder at the beginning (will be index 0)
+    const placeholderFragment = createPlaceholderVoidFragment(text, undefined, modelOp);
+    this.accumulator.fragments.unshift(placeholderFragment); // Add to beginning
 
-    // handle the token stop reason
-    switch (tokenStopReason) {
-      // normal stop
-      case 'ok':                    // content
-      case 'ok-tool_invocations':   // content + tool invocation
-        break;
+    // Placeholders don't affect text fragment indexing
+    // NOTE: we could have placeholders breaking text accumulation into new fragments with `this.currentTextFragmentIndex = null;`, however
+    // since placeholders are used a lot with hosted tool calls, this could lead to way too many fragments being created
+  }
 
-      case 'client-abort-signal':
-        this.accumulator.genTokenStopReason = 'client-abort';
-        break;
+  private onSetVendorState(vs: Extract<AixWire_Particles.PartParticleOp, { p: 'svs' }>): void {
+    // apply vendor state to the last created fragment
+    const lastFragment = this.accumulator.fragments[this.accumulator.fragments.length - 1];
+    if (!lastFragment) {
+      console.warn('[ContentReassembler] Vendor state particle without preceding content fragment');
+      return;
+    }
 
-      case 'out-of-tokens':
-        this.accumulator.genTokenStopReason = 'out-of-tokens';
-        break;
+    // attach vendor state
+    const { vendor, state } = vs;
+    lastFragment.vendorState = {
+      ...lastFragment.vendorState,
+      [vendor]: state,
+    };
+  }
 
-      case 'cg-issue':              // error fragment already added before
-        this.accumulator.genTokenStopReason = 'issue';
-        break;
-
-      case 'filter-content':        // inline text message shall have been added
-      case 'filter-recitation':     // inline text message shall have been added
-        this.accumulator.genTokenStopReason = 'filter';
-        break;
-
-      // unexpected
-      default:
-        // noinspection JSUnusedLocalSymbols
-        const _exhaustiveCheck: never = tokenStopReason;
-        this._appendReassemblyDevError(`Unexpected token stop reason: ${tokenStopReason}`);
-        break;
+  // Helper to remove placeholder when real content arrives
+  private removePlaceholderIfAtIndex0(): void {
+    if (this.accumulator.fragments.length > 0) {
+      const firstFragment = this.accumulator.fragments[0];
+      if (firstFragment.ft === 'void' && firstFragment.part.pt === 'ph') {
+        this.accumulator.fragments.shift(); // Remove placeholder at index 0
+      }
     }
   }
 
-  private onCGIssue({ issueId: _issueId /* Redundant as we add an Error Fragment already */, issueText }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'issue' }>): void {
+
+  /// Rest of the data ///
+
+  /**
+   * Stores raw termination data from the wire - classification deferred to finalizeAccumulator()
+   */
+  private onCGEnd({ terminationReason, tokenStopReason }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'end' }>): void {
+    this._terminationReason = terminationReason;
+    this._tokenStopReasonWire = tokenStopReason;
+  }
+
+  /**
+   * Cross-references both raw termination inputs to derive the DMessage-level tokenStopReason.
+   * Called once at finalization - the single place where wire-level → UI-level classification happens.
+   */
+  private _deriveTokenStopReason(): DMessageGenerator['tokenStopReason'] | undefined {
+    const wire = this._tokenStopReasonWire;
+
+    // First handle client terminations
+    if (this._terminationReason === 'done-client-aborted')
+      return 'client-abort'; // client-side abort is a 'successful' termination with an incomplete message
+    if (this._terminationReason === 'issue-client-rpc') {
+      // error fragment already appended
+      // issue on the client-side, such as interrupted server connection
+      return 'issue';
+    }
+
+    // if the dialect parser explicitly set a stop reason, map it to the DMessageGenerator tokenStopReason enum
+    if (wire) {
+      const mapAixStopToDmessageGeneratorStop: Record<AixWire_Particles.GCTokenStopReason, DMessageGenerator['tokenStopReason'] | undefined> = {
+        // normal completions
+        'ok': undefined,
+        'ok-tool_invocations': undefined,
+        'ok-pause_continue': undefined,
+        // issues: dialect, dispatch, or client
+        'cg-issue': 'issue',
+        // interruptions
+        'out-of-tokens': 'out-of-tokens',
+        'filter-content': 'filter',
+        'filter-recitation': 'filter',
+        'filter-refusal': 'filter',
+      } as const;
+      if (wire in mapAixStopToDmessageGeneratorStop)
+        return mapAixStopToDmessageGeneratorStop[wire];
+      console.warn(`[ContentReassembler] Unmapped tokenStopReason from wire: ${wire}. Fallling back to terminationReason.`);
+    }
+
+    // fall back to terminationReason
+    switch (this._terminationReason) {
+      case undefined:
+        // SEVERE - AIX BUG: don't even know why we terminated
+        console.warn(`⚠️ [ContentReassembler] finished without 'terminationReason' - possible missing 'end' particle. No tokenStopReason can be derived.`);
+        this._appendErrorFragment('Message may be incomplete: missing completion signal.');
+        return undefined;
+
+      case 'done-dialect':
+        // Normal completions: we DO expect a tokenStopReason
+        console.warn(`⚠️ [ContentReassembler] termination by dialect without 'tokenStopReason' - possible dialect parser issue. assuming ok`);
+        this._appendErrorFragment('Message may be incomplete: missing finish reason.');
+        return undefined;
+
+      case 'done-dispatch-closed':
+        // Stream EOF before completion - provider closed the connection without sending a termination signal
+        console.warn(`⚠️ [ContentReassembler] done-dispatch-closed without tokenStopReason - possible truncation`);
+        this._appendErrorFragment('Message may be truncated: stream ended before completion.');
+        return 'issue';
+
+      case 'done-dispatch-aborted':
+        // Dispatch connection may have been severed
+        console.warn(`⚠️ [ContentReassembler] done-dispatch-aborted - stream was aborted, likely due to connection issues. assuming client abort.`);
+        this._appendErrorFragment('Message may be incomplete: AI provider stream was aborted, likely due to connection issues.');
+        return 'client-abort';
+
+      case 'issue-dialect':
+      case 'issue-dispatch-rpc':
+        // error messages already added
+        return 'issue';
+
+      default:
+        const _exhaustiveCheck: never = this._terminationReason;
+        console.warn(`⚠️ [ContentReassembler] unmapped termination reason: ${this._terminationReason} - no tokenStopReason can be derived.`);
+        return undefined;
+    }
+  }
+
+  private onCGIssue({ issueId: _issueId /* Redundant as we add an Error Fragment already */, issueText, issueHint }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'issue' }> & { issueHint?: DMessageErrorPart['hint'] }): void {
     // NOTE: not sure I like the flow at all here
     // there seem to be some bad conditions when issues are raised while the active part is not text
     if (MERGE_ISSUES_INTO_TEXT_PART_IF_OPEN) {
       const currentTextFragment = this.currentTextFragmentIndex === null ? null
         : this.accumulator.fragments[this.currentTextFragmentIndex];
       if (currentTextFragment && isTextContentFragment(currentTextFragment)) {
-        currentTextFragment.part.text += ' ' + issueText;
+        currentTextFragment.part.text += (currentTextFragment.part.text ? '\n' : ' ') + issueText;
         return;
       }
     }
-    this.accumulator.fragments.push(createErrorContentFragment(issueText));
-    this.currentTextFragmentIndex = null;
+    this._appendErrorFragment(issueText, issueHint);
+  }
+
+  private onRetryReset({ rScope, rShallClear, attempt, maxAttempts, delayMs, reason, causeHttp, causeConn }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'retry-reset' }>): void {
+    // operation-level retry likely requires a wipe
+    if (rShallClear) {
+      this.currentTextFragmentIndex = null;
+      this.accumulator.fragments = [];
+      delete this.accumulator.legacyGenTokenStopReason;
+      // reset private termination state
+      this._terminationReason = undefined;
+      this._tokenStopReasonWire = undefined;
+      // keep metrics/model/handle intact - may be useful for debugging retries
+
+      // discard any pending particles from the failed attempt
+      this.wireParticlesBacklog.length = 0;
+    }
+
+    // -> ph: show retry status
+    const retryMessage = `Retrying [${attempt}/${maxAttempts}] in ${Math.round(delayMs / 1000)}s - ${reason}`;
+    this.accumulator.fragments.push(createPlaceholderVoidFragment(retryMessage, undefined, undefined, {
+      ctl: 'ec-retry',
+      rScope: rScope,
+      rAttempt: attempt,
+      ...(causeHttp ? { rCauseHttp: causeHttp } : undefined),
+      ...(causeConn ? { rCauseConn: causeConn } : undefined),
+    }));
   }
 
   private onMetrics({ metrics }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'set-metrics' }>): void {
@@ -637,6 +794,20 @@ export class ContentReassembler {
     this.accumulator.genModelName = name;
   }
 
+  private onProviderInfra({ label }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'set-provider-infra' }>): void {
+    this.accumulator.genProviderInfraLabel = label;
+  }
+
+  private onResponseHandle({ handle }: Extract<AixWire_Particles.ChatGenerateOp, { cg: 'set-upstream-handle' }>): void {
+    // validate the handle
+    if (handle?.uht !== 'vnd.oai.responses' || !handle?.responseId || handle?.expiresAt === undefined) {
+      this._appendReassemblyDevError(`Invalid response handle received: ${JSON.stringify(handle)}`);
+      return;
+    }
+    // type check point for AixWire_Particles.ChatControlOp('set-upstream-handle') -> DUpstreamResponseHandle
+    this.accumulator.genUpstreamHandle = handle;
+  }
+
 
   // utility
 
@@ -647,7 +818,11 @@ export class ContentReassembler {
       if (excess > 0)
         errorText = ellipsizeMiddle(errorText, ELLIPSIZE_DEV_ISSUE_MESSAGES - truncationMessage.length, truncationMessage);
     }
-    this.accumulator.fragments.push(createErrorContentFragment((omitPrefix ? '' : 'AIX Content Reassembler: ') + errorText));
+    this._appendErrorFragment((omitPrefix ? '' : 'AIX Content Reassembler: ') + errorText);
+  }
+
+  private _appendErrorFragment(errorText: string, errorHint?: DMessageErrorPart['hint']): void {
+    this.accumulator.fragments.push(createErrorContentFragment(errorText, errorHint));
     this.currentTextFragmentIndex = null;
   }
 

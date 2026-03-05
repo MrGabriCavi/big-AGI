@@ -16,12 +16,12 @@ const _styles = {
     boxShadow: 'inset 2px 0 4px -2px rgba(0, 0, 0, 0.2)',
     fontFamily: 'code',
     fontSize: 'xs',
-    p: 1.5,
+    py: 1,
     gap: 1,
   } as const,
 
   requestCardText: {
-    whiteSpace: 'pre',
+    whiteSpace: 'pre-wrap',
   } as const,
 
   particleNorminal: {
@@ -62,23 +62,29 @@ export function AixDebuggerFrame(props: {
 
   const { frame } = props;
 
+  const contextName = frame.context?.contextName || '';
+  const isConversation = contextName === 'conversation';
+
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--Card-padding, 1rem)' }}>
 
       {/* Frame Header */}
-      <Box sx={{ fontSize: 'sm', display: 'grid', gridTemplateColumns: { xs: 'auto 1fr', md: 'auto 1fr auto 1fr' }, gap: 1, alignItems: 'center' }}>
-        <Typography fontWeight='bold'>Request </Typography>
-        <Typography fontWeight='bold'>{frame.id}</Typography>
+      <Box sx={{ fontSize: 'sm', display: 'grid', gridTemplateColumns: { xs: 'auto 1fr', md: 'auto auto auto auto' }, gap: 0.5, alignItems: 'center' }}>
+        <div>Request</div>
+        <Box fontWeight='md'>#{frame.id}</Box>
         <div>Status:</div>
-        <Chip variant='soft' color={frame.isComplete ? 'success' : 'warning'}>{frame.isComplete ? 'Complete' : 'In Progress'}</Chip>
+        <Box sx={{ display: 'flex', gap: 1 }}>
+          <Chip variant={frame.transport !== 'csf' ? undefined : 'solid'} color={frame.transport === 'csf' ? 'primary' : 'success'}>{frame.transport === 'csf' ? 'Direct Connection' : 'Edge Server'}</Chip>
+          <Chip variant={frame.isComplete ? undefined : 'solid'} color={frame.isComplete ? 'success' : 'warning'}>{frame.isComplete ? 'Done' : 'In Progress'}</Chip>
+        </Box>
         <div>Date</div>
         <div>{new Date(frame.timestamp).toLocaleString()}</div>
         <div>-&gt; URL:</div>
-        <Chip>{frame.url || 'No URL data available'}</Chip>
+        <div className='agi-ellipsize'>{decodeURIComponent(frame.url) || 'No URL data available'}</div>
         <div>Context:</div>
-        <Chip>{frame.context.contextName}</Chip>
+        <Chip variant={isConversation ? 'soft' : 'solid'} color='primary'>{contextName}</Chip>
         <div>Reference:</div>
-        <Chip>{frame.context.contextRef}</Chip>
+        <div>{frame.context.contextRef}</div>
       </Box>
 
       {/* Headers */}
@@ -94,17 +100,18 @@ export function AixDebuggerFrame(props: {
 
       {/* Body */}
       <Card variant='soft' color='primary' sx={_styles.requestCard}>
-        <Typography color='primary' variant='soft' level='title-sm'>
-          -&gt; Body
+        <Typography color='primary' variant='soft' level='title-sm' sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>-&gt; Body</span>
+          {frame.bodySize > 0 && <span>{frame.bodySize.toLocaleString()} bytes</span>}
         </Typography>
         <Divider />
         <Box sx={_styles.requestCardText}>
-          {frame.body || 'No headers data available'}
+          {frame.body || 'Waiting for the body data available'}
         </Box>
       </Card>
 
       {/* Performance Profiler */}
-      <Card variant='soft' color='success' sx={_styles.requestCard}>
+      {!!frame.profilerMeasurements?.length && <Card variant='soft' color='success' sx={_styles.requestCard}>
         <Typography color='success' variant='soft' level='title-sm' startDecorator={<TimelapseIcon />}>
           Internal Profiler:
         </Typography>
@@ -113,7 +120,7 @@ export function AixDebuggerFrame(props: {
         ) : (
           'No profiler measurements available. Note: profiling is not available in production.'
         )}
-      </Card>
+      </Card>}
 
       {/* Particles List */}
       <Box mb={showParticles ? -2 : undefined} sx={_styles.particleNorminal}>

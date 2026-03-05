@@ -1,59 +1,169 @@
-import { anthropicAccess } from '~/modules/llms/server/anthropic/anthropic.router';
-import { geminiAccess } from '~/modules/llms/server/gemini/gemini.router';
-import { ollamaAccess } from '~/modules/llms/server/ollama/ollama.router';
-import { openAIAccess } from '~/modules/llms/server/openai/openai.router';
+import { ANTHROPIC_API_PATHS, anthropicAccess, anthropicBetaFeatures, AnthropicHeaderOptions } from '~/modules/llms/server/anthropic/anthropic.access';
+import { OPENAI_API_PATHS, openAIAccess } from '~/modules/llms/server/openai/openai.access';
+import { bedrockAccessAsync, bedrockResolveRegion, bedrockURLMantle, bedrockURLRuntime } from '~/modules/llms/server/bedrock/bedrock.access';
+import { geminiAccess } from '~/modules/llms/server/gemini/gemini.access';
+import { ollamaAccess } from '~/modules/llms/server/ollama/ollama.access';
 
-import type { AixAPI_Access, AixAPI_Model, AixAPIChatGenerate_Request } from '../../api/aix.wiretypes';
+import type { AixAPI_Access, AixAPI_Model, AixAPI_ResumeHandle, AixAPIChatGenerate_Request } from '../../api/aix.wiretypes';
 import type { AixDemuxers } from '../stream.demuxers';
 
 import { GeminiWire_API_Generate_Content } from '../wiretypes/gemini.wiretypes';
 
 import { aixToAnthropicMessageCreate } from './adapters/anthropic.messageCreate';
+import { aixToBedrockConverse } from './adapters/bedrock.converse';
 import { aixToGeminiGenerateContent } from './adapters/gemini.generateContent';
 import { aixToOpenAIChatCompletions } from './adapters/openai.chatCompletions';
 import { aixToOpenAIResponses } from './adapters/openai.responsesCreate';
+import { aixToXAIResponses } from './adapters/xai.responsesCreate';
 
-import type { IParticleTransmitter } from './IParticleTransmitter';
+import type { IParticleTransmitter } from './parsers/IParticleTransmitter';
 import { createAnthropicMessageParser, createAnthropicMessageParserNS } from './parsers/anthropic.parser';
+import { createBedrockConverseParserNS, createBedrockConverseStreamParser } from './parsers/bedrock-converse.parser';
 import { createGeminiGenerateContentResponseParser } from './parsers/gemini.parser';
 import { createOpenAIChatCompletionsChunkParser, createOpenAIChatCompletionsParserNS } from './parsers/openai.parser';
-import { createOpenAIResponsesEventParser, createOpenAIResponseParserNS, } from './parsers/openai.responses.parser';
+import { createOpenAIResponseParserNS, createOpenAIResponsesEventParser } from './parsers/openai.responses.parser';
 
 
-/**
- * Interface for the vendor parsers to implement
- */
-export type ChatGenerateParseFunction = (partTransmitter: IParticleTransmitter, eventData: string, eventName?: string) => void;
+// -- Dispatch types --
 
+export type ChatGenerateDispatch = {
+  request: ChatGenerateDispatchRequest;
+  bodyTransform?: AixDemuxers.StreamBodyTransform;
+  demuxerFormat: AixDemuxers.StreamDemuxerFormat;
+  chatGenerateParse: ChatGenerateParseFunction;
+};
+
+export type ChatGenerateDispatchRequest =
+  | { url: string, headers: HeadersInit, method: 'POST', body: object }
+  | { url: string, headers: HeadersInit, method: 'GET' };
+
+export type ChatGenerateParseContext = {
+  retriesAvailable: boolean;
+};
+
+export type ChatGenerateParseFunction = (partTransmitter: IParticleTransmitter, eventData: string, eventName?: string, context?: ChatGenerateParseContext) => void;
+
+
+// -- Specialized Implementations -- Core of Server-side AI Vendors abstraction --
 
 /**
  * Specializes to the correct vendor a request for chat generation
  */
-export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_Model, chatGenerate: AixAPIChatGenerate_Request, streaming: boolean): {
-  request: { url: string, headers: HeadersInit, body: object },
-  demuxerFormat: AixDemuxers.StreamDemuxerFormat;
-  chatGenerateParse: ChatGenerateParseFunction;
-} {
+export async function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_Model, chatGenerate: AixAPIChatGenerate_Request, streaming: boolean, enableResumability: boolean): Promise<ChatGenerateDispatch> {
 
-  switch (access.dialect) {
-    case 'anthropic':
+  const { dialect } = access;
+  switch (dialect) {
+    case 'anthropic': {
+
+      // [Anthropic, 2025-11-24] Detect if any tool uses Programmatic Tool Calling features (allowed_callers, input_examples)
+      const usesProgrammaticToolCalling = chatGenerate.tools?.some(tool =>
+          tool.type === 'function_call' && (
+            tool.function_call.allowed_callers?.includes('code_execution') ||
+            (tool.function_call.input_examples && tool.function_call.input_examples.length > 0)
+          ),
+      ) ?? false;
+
+      const anthropicRequest = anthropicAccess(access, ANTHROPIC_API_PATHS.messages,
+        _anthropicBetaOptionsFromModel(model, usesProgrammaticToolCalling),
+      );
+
+      // Build the request body from model + chat parameters
+      const anthropicBody = aixToAnthropicMessageCreate(model, chatGenerate, streaming);
+
+      // [Anthropic, 2026-02-01] Service-level inference geo routing (e.g. "us")
+      if (access.anthropicInferenceGeo)
+        anthropicBody.inference_geo = access.anthropicInferenceGeo;
+
       return {
         request: {
-          ...anthropicAccess(access, model.id, '/v1/messages'),
-          body: aixToAnthropicMessageCreate(model, chatGenerate, streaming),
+          ...anthropicRequest,
+          method: 'POST',
+          body: anthropicBody,
         },
         demuxerFormat: streaming ? 'fast-sse' : null,
         chatGenerateParse: streaming ? createAnthropicMessageParser() : createAnthropicMessageParserNS(),
       };
+    }
+
+    case 'bedrock': {
+      switch (model.vndBedrockAPI) {
+
+        // [Bedrock Converse] Bedrock-native API, preferred for Amazon models and useful in others too
+        case 'converse': {
+          const converseUrl = bedrockURLRuntime(bedrockResolveRegion(access), model.id, 'converse', streaming);
+          const converseBody = aixToBedrockConverse(model, chatGenerate);
+          return {
+            request: {
+              ...await bedrockAccessAsync(access, 'POST', converseUrl, converseBody),
+              method: 'POST' as const,
+              body: converseBody,
+            },
+            bodyTransform: streaming ? 'aws-eventstream-binary' : null,
+            demuxerFormat: streaming ? 'fast-sse' : null,
+            chatGenerateParse: streaming ? createBedrockConverseStreamParser() : createBedrockConverseParserNS(),
+          };
+        }
+
+        // [Bedrock Invoke] Anthropic-native InvokeModel API
+        case 'invoke-anthropic':
+          const invokeUrl = bedrockURLRuntime(bedrockResolveRegion(access), model.id, 'invoke', streaming);
+
+          // body
+          const bedrockAnthropicBody: Record<string, any> = aixToAnthropicMessageCreate(model, chatGenerate, streaming);
+          delete bedrockAnthropicBody.model; // model in path
+          delete bedrockAnthropicBody.stream; // streaming behavior in path
+          // headers['anthropic-version'] -> body
+          bedrockAnthropicBody.anthropic_version = 'bedrock-2023-05-31';
+          // headers['anthropic-beta'] -> body
+          bedrockAnthropicBody.anthropic_beta = anthropicBetaFeatures(
+            _anthropicBetaOptionsFromModel(model /* note that .id won't match, and it's okay, we don't need per model customizations */, false /* hardcoded */),
+          );
+          if (!bedrockAnthropicBody.anthropic_beta?.length)
+            delete bedrockAnthropicBody.anthropic_beta;
+
+          return {
+            request: {
+              ...await bedrockAccessAsync(access, 'POST', invokeUrl, bedrockAnthropicBody),
+              method: 'POST',
+              body: bedrockAnthropicBody,
+            },
+            bodyTransform: streaming ? 'aws-eventstream-binary' : null,
+            demuxerFormat: streaming ? 'fast-sse' : null,
+            chatGenerateParse: streaming ? createAnthropicMessageParser() : createAnthropicMessageParserNS(),
+          };
+
+        // [Bedrock Mantle] OpenAI Chat Completions-compatible API for non-Anthropic models
+        case 'mantle':
+          const mantleUrl = bedrockURLMantle(bedrockResolveRegion(access), '/v1/chat/completions');
+          const mantleBody = aixToOpenAIChatCompletions('openai', model, chatGenerate, streaming);
+          return {
+            request: {
+              ...await bedrockAccessAsync(access, 'POST', mantleUrl, mantleBody),
+              method: 'POST',
+              body: mantleBody,
+            },
+            demuxerFormat: streaming ? 'fast-sse' : null,
+            chatGenerateParse: streaming ? createOpenAIChatCompletionsChunkParser() : createOpenAIChatCompletionsParserNS(),
+          };
+
+        default:
+          const _exhaustiveCheck: never = model.vndBedrockAPI;
+        // fallthrough, then throw
+        case undefined:
+          break;
+      }
+      throw new Error(`Unsupported '${model.vndBedrockAPI}' API.`);
+    }
 
     case 'gemini':
       /**
        * [Gemini, 2025-04-17] For newer thinking parameters, use v1alpha (we only see statistically better results)
        */
-      const useV1Alpha = !!model.vndGeminiShowThoughts || model.vndGeminiThinkingBudget !== undefined;
+      const useV1Alpha = false; // !!model.vndGeminiShowThoughts || model.vndGeminiThinkingBudget !== undefined;
       return {
         request: {
           ...geminiAccess(access, model.id, streaming ? GeminiWire_API_Generate_Content.streamingPostPath : GeminiWire_API_Generate_Content.postPath, useV1Alpha),
+          method: 'POST',
           body: aixToGeminiGenerateContent(model, chatGenerate, access.minSafetyLevel, false, streaming),
         },
         // we verified that 'fast-sse' works well with Gemini
@@ -62,18 +172,19 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
       };
 
     /**
-     * Ollama has now an OpenAI compability layer for `chatGenerate` API, but still its own protocol for models listing.
+     * Ollama has now an OpenAI compatibility layer for `chatGenerate` API, but still its own protocol for models listing.
      * - as such, we 'cast' here to the dispatch to an OpenAI dispatch, while using Ollama access
-     * - we still use the ollama.router for the models listing and aministration APIs
+     * - we still use the ollama.router for the models listing and administration APIs
      *
      * For reference we show the old code for body/demuxerFormat/chatGenerateParse also below
      */
     case 'ollama':
       return {
         request: {
-          ...ollamaAccess(access, '/v1/chat/completions'), // use the OpenAI-compatible endpoint
-          // body: ollamaChatCompletionPayload(model, _hist, access.ollamaJson, streaming),
-          body: aixToOpenAIChatCompletions('openai', model, chatGenerate, access.ollamaJson, streaming),
+          ...ollamaAccess(access, OPENAI_API_PATHS.chatCompletions), // use the OpenAI-compatible endpoint
+          method: 'POST',
+          // body: ollamaChatCompletionPayload(model, _hist, streaming),
+          body: aixToOpenAIChatCompletions('openai', model, chatGenerate, streaming),
         },
         // demuxerFormat: streaming ? 'json-nl' : null,
         demuxerFormat: streaming ? 'fast-sse' : null,
@@ -81,6 +192,9 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
         chatGenerateParse: streaming ? createOpenAIChatCompletionsChunkParser() : createOpenAIChatCompletionsParserNS(),
       };
 
+    default:
+      const _exhaustiveCheck: never = dialect;
+    // fallthrough
     case 'alibaba':
     case 'azure':
     case 'deepseek':
@@ -88,33 +202,124 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
     case 'lmstudio':
     case 'localai':
     case 'mistral':
+    case 'moonshot':
     case 'openai':
     case 'openpipe':
     case 'openrouter':
     case 'perplexity':
     case 'togetherai':
     case 'xai':
+    case 'zai':
 
-      // switch to the Responses API if the model supports it
+      // newer: OpenAI Responses API, for models that support it and all XAI models
       const isResponsesAPI = !!model.vndOaiResponsesAPI;
-      if (isResponsesAPI) {
+      const isXAIModel = dialect === 'xai'; // All XAI models are accessed via Responses now
+      if (isResponsesAPI || isXAIModel) {
         return {
           request: {
-            ...openAIAccess(access, model.id, '/v1/responses'),
-            body: aixToOpenAIResponses(access.dialect, model, chatGenerate, false, streaming),
+            ...openAIAccess(access, model.id, OPENAI_API_PATHS.responses),
+            method: 'POST',
+            /**
+             * xAI uses its own Responses API adapter.
+             *
+             * Key differences from OpenAI Responses API:
+             * - No 'instructions' field - system content prepended to first user message
+             * - xAI-native tools: web_search, x_search, code_execution
+             * - Tool calls come in single chunks
+             *
+             * Note: Response format is compatible with OpenAI parser.
+             */
+            body: isXAIModel ? aixToXAIResponses(model, chatGenerate, streaming, enableResumability)
+              : aixToOpenAIResponses(dialect, model, chatGenerate, streaming, enableResumability),
           },
           demuxerFormat: streaming ? 'fast-sse' : null,
           chatGenerateParse: streaming ? createOpenAIResponsesEventParser() : createOpenAIResponseParserNS(),
         };
       }
 
+      // default: industry-standard OpenAI ChatCompletions API with per-dialect extensions
+      const chatCompletionsBody = aixToOpenAIChatCompletions(dialect, model, chatGenerate, streaming);
+
+      // [OpenRouter] Service-level provider routing parameter
+      if (dialect === 'openrouter' && access.orRequireParameters)
+        chatCompletionsBody.provider = { ...chatCompletionsBody.provider, require_parameters: true };
+
       return {
         request: {
-          ...openAIAccess(access, model.id, '/v1/chat/completions'),
-          body: aixToOpenAIChatCompletions(access.dialect, model, chatGenerate, false, streaming),
+          ...openAIAccess(access, model.id, OPENAI_API_PATHS.chatCompletions),
+          method: 'POST',
+          body: chatCompletionsBody,
         },
         demuxerFormat: streaming ? 'fast-sse' : null,
         chatGenerateParse: streaming ? createOpenAIChatCompletionsChunkParser() : createOpenAIChatCompletionsParserNS(),
       };
+
+  }
+}
+
+/** Used by both Anthropic direct and Bedrock dispatch paths. */
+function _anthropicBetaOptionsFromModel(model: AixAPI_Model, usesProgrammaticToolCalling: boolean): AnthropicHeaderOptions {
+  return {
+    modelIdForBetaFeatures: model.id,
+    vndAntWebFetch: model.vndAntWebFetch === 'auto',
+    vndAnt1MContext: model.vndAnt1MContext === true,
+    enableSkills: !!model.vndAntSkills,
+    enableFastMode: model.vndAntInfSpeed === 'fast',
+    enableStrictOutputs: !!model.strictJsonOutput || !!model.strictToolInvocations, // [Anthropic, 2025-11-13] for both JSON output and grammar-constrained tool invocations inputs
+    enableToolSearch: !!model.vndAntToolSearch,
+    enableProgrammaticToolCalling: usesProgrammaticToolCalling,
+    // enableCodeExecution: ...
+  };
+}
+
+
+/**
+ * Specializes to the correct vendor a request for resuming chat generation (OpenAI Responses API only).
+ * Constructs a GET request to retrieve and stream a response by its ID.
+ */
+export async function createChatGenerateResumeDispatch(access: AixAPI_Access, resumeHandle: AixAPI_ResumeHandle, streaming: boolean): Promise<ChatGenerateDispatch> {
+
+  const { dialect } = access;
+  switch (dialect) {
+    case 'azure':
+    case 'openai':
+    case 'openrouter':
+
+      // ASSUME the OpenAI Responses API - https://platform.openai.com/docs/api-reference/responses/get
+      const { url, headers } = openAIAccess(access, '', `${OPENAI_API_PATHS.responses}/${resumeHandle.responseId}`);
+      const queryParams = new URLSearchParams({
+        stream: streaming ? 'true' : 'false',
+        ...(!!resumeHandle.startingAfter && { starting_after: resumeHandle.startingAfter.toString() }),
+        // include_obfuscation: ...
+      });
+
+      return {
+        request: { url: `${url}?${queryParams.toString()}`, method: 'GET', headers },
+        demuxerFormat: streaming ? 'fast-sse' : null,
+        chatGenerateParse: streaming ? createOpenAIResponsesEventParser() : createOpenAIResponseParserNS(),
+      };
+
+    default:
+      const _exhaustiveCheck: never = dialect;
+    // fallthrough
+    case 'alibaba':
+    case 'anthropic':
+    case 'bedrock':
+    case 'deepseek':
+    case 'gemini':
+    case 'groq':
+    case 'lmstudio':
+    case 'localai':
+    case 'mistral':
+    case 'moonshot':
+    case 'ollama':
+    case 'openpipe':
+    case 'perplexity':
+    case 'togetherai':
+    case 'xai':
+    case 'zai':
+      // Throw on unsupported protocols (Azure and OpenRouter are speculatively supported)
+      throw new Error(`Resume not supported for dialect: ${dialect}`);
+
   }
 }

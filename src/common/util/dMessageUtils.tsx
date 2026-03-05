@@ -34,11 +34,11 @@ export const avatarIconSx = {
   width: 36,
 } as const;
 
-const largerAvatarIconsSx = {
-  borderRadius: 'sm',
-  width: 48,
-  height: 48,
-};
+// const largerAvatarIconsSx = {
+//   borderRadius: 'sm',
+//   width: 48,
+//   height: 48,
+// };
 
 const aixSkipBoxSx = {
   height: 36,
@@ -148,7 +148,8 @@ export function makeMessageAvatarIcon(
               : isTextToImage ? ANIM_BUSY_PAINTING
                 : isReact ? ANIM_BUSY_THINKING
                   : ANIM_BUSY_TYPING}
-            sx={larger ? largerAvatarIconsSx : avatarIconSx}
+            sx={avatarIconSx}
+            // sx={larger ? largerAvatarIconsSx : avatarIconSx}
           />;
 
         // Purpose image (if present)
@@ -257,6 +258,7 @@ export function useMessageAvatarLabel(
       tooltip: complexity === 'minimal' ? null : (
         <Box sx={tooltipSx}>
           {VendorIcon ? <Box sx={tooltipIconContainerSx}><VendorIcon />{generator.name}</Box> : <div>{generator.name}</div>}
+          {generator.providerInfraLabel && <div>{vendorId} -&gt; via &lsquo;{generator.providerInfraLabel}&rsquo;</div>}
           {(modelId && complexity === 'extra') && <div>{modelId}</div>}
           {metrics && <div>{metrics}</div>}
           {stopReason && <div>{stopReason}</div>}
@@ -311,7 +313,13 @@ function _prettyMetrics(metrics: DMessageGenerator['metrics'], uiComplexityMode:
         })</small>
       </>}
     </div>}
-    {costCode && <div>{metrics?.$c !== undefined ? 'Costs:' : ''}</div>}
+    {/* Add the 'reported' costs underneath, if defined */}
+    {metrics?.$cReported !== undefined && <div>{metrics?.$c !== undefined ? '' : 'Costs:'}</div>}
+    {metrics?.$cReported !== undefined && <div>
+      <small>reported: <b>{formatModelsCost(metrics.$cReported / 100)}</b></small>
+    </div>}
+    {/* Add the cost 'code' underneath, if any */}
+    {costCode && <div>{(metrics?.$c !== undefined || metrics?.$cReported !== undefined) ? '' : 'Costs:'}</div>}
     {costCode && <div><em>{costCode}</em></div>}
 
     {/* Time */}
@@ -347,11 +355,14 @@ function _prettyTokenStopReason(reason: DMessageGenerator['tokenStopReason'], co
       return complexity === 'extra' ? 'Error' : '';
     case 'out-of-tokens':
       return 'Out of Tokens';
+    default:
+      const _exhaustiveCheck: never = reason;
+      return null;
   }
 }
 
 
-const oaiORegex = /gpt-[345](?:o|\.\d+)?-|o[1345]-|chatgpt-[45]o?|gpt-5-chat|computer-use-/;
+const oaiORegex = /gpt-[345](?:o|\.\d+)?-|o[1345]-|osb-|chatgpt-[45]o?|gpt-5-chat|computer-use-/;
 const geminiRegex = /gemini-|gemma-|learnlm-/;
 
 
@@ -372,6 +383,7 @@ export function prettyShortChatModelName(model: string | undefined): string {
       .replace('chatgpt-', 'ChatGPT_')
       .replace('gpt-5-chat-', 'ChatGPT-5 ')
       .replace('gpt-', 'GPT_')
+      .replace('osb-', 'OSB_')
       // feature variants
       .replace('-audio', ' Audio')
       .replace('-realtime-preview', ' Realtime')
@@ -419,6 +431,10 @@ export function prettyShortChatModelName(model: string | undefined): string {
       cutModel = cutModel.slice(0, cutModel.length - dateMatch[0].length); // remove '-05-15'
     }
     const geminiName = cutModel
+      // commercial aliases
+      .replace('gemini-3-pro-image', 'Nano Banana Pro')
+      .replace('gemini-2.5-flash-image', 'Nano Banana')
+      // root changes
       .replace('non-thinking', '') // NOTE: this is our variant, injected in gemini.models.ts
       .replaceAll('-', ' ')
       // products
@@ -429,6 +445,7 @@ export function prettyShortChatModelName(model: string | undefined): string {
       .replace('pro', 'Pro')
       .replace('flash', 'Flash')
       // feature variants
+      .replace('robotics er', 'Robotics')
       .replace('generation', 'Gen')
       .replace('image', 'Image')
       .replace('thinking', 'Thinking')
@@ -442,8 +459,14 @@ export function prettyShortChatModelName(model: string | undefined): string {
     // start past the last /, if any
     const lastSlashIndex = model.lastIndexOf('/');
     const modelName = lastSlashIndex === -1 ? model : model.slice(lastSlashIndex + 1);
-    return modelName.replace('deepseek-', ' Deepseek ')
-      .replace('reasoner', 'R1').replace('r1', 'R1')
+    return modelName
+      // map these for each release
+      .replace('-reasoner', ' 3.2 Reasoner')
+      .replace('-chat', ' 3.2 Chat')
+      .replace('-v3', ' 3')
+      // default replacements
+      .replace('deepseek', 'Deepseek')
+      .replace('speciale', 'Speciale').replace('@', ' ')
       .replaceAll('-', ' ')
       .trim();
   }
@@ -462,14 +485,29 @@ export function prettyShortChatModelName(model: string | undefined): string {
   }
   // [xAI]
   if (model.includes('grok-')) {
-    if (model.includes('grok-3') || model.includes('grok-2')) {
+    if (['grok-code', 'grok-4', 'grok-3', 'grok-2'].some(m => model.includes(m))) {
       return model
         .replace('xai-', '')
         .replace('-beta', '')
+        .replace('-non-reasoning', '')
         .split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ');
     }
     if (model.includes('grok-beta')) return 'Grok Beta';
     if (model.includes('grok-vision-beta')) return 'Grok Vision Beta';
+  }
+  // [Z.ai]
+  if (model.startsWith('glm-')) {
+    return model
+      .replace('glm-', 'GLM-')
+      .replace('ocr', 'OCR')
+      .replace(/(\d)v/, '$1 V')   // vision suffix: 4.6v → 4.6 V
+      .replace('-flashx', ' FlashX')
+      .replace('-flash', ' Flash')
+      .replace('-airx', ' AirX')
+      .replace('-air', ' Air')
+      .replace('-code', ' Code')
+      .replace(/-x$/, ' X')
+      .replace(/-32b.*$/, ' 32B');
   }
   // [FireworksAI]
   if (model.includes('accounts/')) {
@@ -496,17 +534,19 @@ function _prettyAnthropicModelName(modelId: string): string | null {
 
   const subStr = modelId.slice(claudeIndex);
   const version =
-    subStr.includes('-3-5') ? '3.5' // fixes the -5
-      : subStr.includes('-5') ? '5'
-        : subStr.includes('-4-1') ? '4.1'
-          : subStr.includes('-4') ? '4'
-            : subStr.includes('-3-7') ? '3.7'
-              : subStr.includes('-3') ? '3'
-                : '?';
+    subStr.includes('-4-6') ? '4.6'
+      : subStr.includes('-4-5') ? '4.5' // fixes the -5
+        : subStr.includes('-3-5') ? '3.5' // fixes the -5
+          : subStr.includes('-5') ? '5'
+            : subStr.includes('-4-1') ? '4.1'
+              : subStr.includes('-4') ? '4'
+                : subStr.includes('-3-7') ? '3.7'
+                  : subStr.includes('-3') ? '3'
+                    : '?';
 
-  if (subStr.includes(`-opus`)) return `Claude ${version} Opus`;
-  if (subStr.includes(`-sonnet`)) return `Claude ${version} Sonnet`;
-  if (subStr.includes(`-haiku`)) return `Claude ${version} Haiku`;
+  if (subStr.includes(`-opus`)) return `Claude Opus ${version}`;
+  if (subStr.includes(`-sonnet`)) return `Claude Sonnet ${version}`;
+  if (subStr.includes(`-haiku`)) return `Claude Haiku ${version}`;
 
   return `Claude ${version}`;
 }

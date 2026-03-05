@@ -1,9 +1,14 @@
 import * as React from 'react';
 
+import type { SxProps } from '@mui/joy/styles/types';
 import { FormControl, Slider, VariantProp } from '@mui/joy';
 
 import { FormLabelStart } from './FormLabelStart';
 
+
+const _styleNoTrack = {
+  '--Slider-trackBackground': 'transparent'
+} as const satisfies SxProps;
 
 /**
  * Slider Control
@@ -18,6 +23,8 @@ export function FormSliderControl(props: {
   value: number | number[] | null, onChange: (value: number) => void,
   startAdornment?: React.ReactNode,
   endAdornment?: React.ReactNode,
+  styleNoTrack?: boolean,
+  sliderSx?: SxProps,
 }) {
 
 
@@ -60,7 +67,7 @@ export function FormSliderControl(props: {
         onChange={handleChange}
         onChangeCommitted={handleChangeCommitted}
         valueLabelDisplay={props.valueLabelDisplay}
-        // sx={{ py: 1, mt: 1.1 }}
+        sx={props.styleNoTrack ? _styleNoTrack : props.sliderSx}
       />
       {props.endAdornment}
     </FormControl>

@@ -26,6 +26,23 @@ export interface DMessage {
 
   generator?: DMessageGenerator;      // Assistant generator info, and metrics
 
+  /**
+   * Session metadata for multi-turn agentic sessions.
+   *
+   * Enables stateful time-monotonic multi-turn interactions in a stateless architecture:
+   * - Parsers accumulate session values (container IDs, response handles, etc.)
+   * - Request builders traverse history for latest non-expired values
+   * - Child messages inherit parent session, new values override
+   *
+   * Pattern:
+   * 1. Parser extracts vendor session data → stores in sessionMetadata
+   * 2. Request builder finds latest value per key → includes in next request
+   * 3. Vendor reuses session (e.g., Anthropic container for file access, OpenAI response for reconnection)
+   *
+   * Keys namespaced by vendor: 'anthropic.container.id', 'openai.response.id'
+   */
+  // sessionMetadata?: DMessageSessionMetadata;
+
   userFlags?: DMessageUserFlag[];     // (UI) user-set per-message flags
 
   // TODO: @deprecated remove this, it's really view-dependent
@@ -42,12 +59,27 @@ export type DMessageId = string;
 
 export type DMessageRole = 'user' | 'assistant' | 'system';
 
+/**
+ * Session metadata carrying vendor-specific state across multi-turn agentic sessions.
+ * Namespaced keys (e.g., 'anthropic.container.id'), child inherits parent, new values override.
+ *
+ * NOTE: may use some typescript module augmentation to plug new keys and value types here.
+ * NOTE2: may add references to the parent sessions/unique Ids, although they may be the message itself
+ */
+// export type DMessageSessionMetadata = Record<string, string | number | boolean | null>;
+
 
 // Message > Metadata
 
 export interface DMessageMetadata {
   inReferenceTo?: DMetaReferenceItem[]; // text this was in reply to
   entangled?: DMessageEntangled; // entangled messages info
+  /**
+   * Initially intended recipients of this message.
+   * Defaults to `undefined` i.e. the current persona for the active operation (chat, beam, etc).
+   * If set, has to be honored by the UI and the sending operation.
+   */
+  initialRecipients?: DMessageRecipientPersona[];
   // NOTE: if adding fields, manually update `duplicateDMessageMetadata`
 }
 
@@ -64,6 +96,12 @@ export interface DMessageEntangled {
   id: string;           // entanglement group ID
   color: string;        // hex color for visual connection
   count: number;        // total number of chats this was sent to
+}
+
+/** Recipient of a message - currently persona-based but extensible for future recipient types. */
+export interface DMessageRecipientPersona {
+  rt: 'persona'; // recipient type discriminant
+  personaUid: string | null; // null = explicit "no persona"
 }
 
 
@@ -103,6 +141,12 @@ export type DMessageGenerator = ({
   },
 }) & {
   metrics?: DMetricsChatGenerate_Md;   // medium-sized metrics stored in the message
+  providerInfraLabel?: string;         // upstream provider that served the request (e.g., OpenRouter provider routing)
+  upstreamHandle?: {
+    uht: 'vnd.oai.responses',
+    responseId: string,
+    expiresAt: number | null,         // null = never expires
+  },
   tokenStopReason?:
     | 'client-abort'                  // if the generator stopped due to a client abort signal
     | 'filter'                        // (inline filter message injected) if the generator stopped due to a filter
@@ -168,6 +212,7 @@ export function duplicateDMessage(message: Readonly<DMessage>, skipVoid: boolean
 
     metadata: message.metadata ? duplicateDMessageMetadata(message.metadata) : undefined,
     generator: message.generator ? duplicateDMessageGenerator(message.generator) : undefined,
+    // sessionMetadata: message.sessionMetadata ? duplicateDMessageSession(message.sessionMetadata) : undefined,
     userFlags: message.userFlags ? [...message.userFlags] : undefined,
 
     tokenCount: message.tokenCount,
@@ -186,6 +231,9 @@ export function duplicateDMessageMetadata(metadata: Readonly<DMessageMetadata>):
     ...(metadata.entangled ? {
       entangled: { ...metadata.entangled },
     } : {}),
+    ...(metadata.initialRecipients?.length ? {
+      initialRecipients: metadata.initialRecipients.map(recipient => ({ ...recipient })),
+    } : {}),
   };
 }
 
@@ -197,6 +245,8 @@ export function duplicateDMessageGenerator(generator: Readonly<DMessageGenerator
         name: generator.name,
         // ...(generator.xeOpCode ? { xeOpCode: generator.xeOpCode } : {}),
         ...(generator.metrics ? { metrics: { ...generator.metrics } } : {}),
+        ...(generator.providerInfraLabel ? { providerInfraLabel: generator.providerInfraLabel } : {}),
+        ...(generator.upstreamHandle ? { upstreamHandle: { ...generator.upstreamHandle } } : {}),
         ...(generator.tokenStopReason ? { tokenStopReason: generator.tokenStopReason } : {}),
       };
     case 'aix':
@@ -205,6 +255,8 @@ export function duplicateDMessageGenerator(generator: Readonly<DMessageGenerator
         name: generator.name,
         aix: { ...generator.aix },
         ...(generator.metrics ? { metrics: { ...generator.metrics } } : {}),
+        ...(generator.providerInfraLabel ? { providerInfraLabel: generator.providerInfraLabel } : {}),
+        ...(generator.upstreamHandle ? { upstreamHandle: { ...generator.upstreamHandle } } : {}),
         ...(generator.tokenStopReason ? { tokenStopReason: generator.tokenStopReason } : {}),
       };
   }
@@ -214,12 +266,55 @@ export function duplicateDMessageGenerator(generator: Readonly<DMessageGenerator
 // helpers - status checks
 
 export function messageWasInterruptedAtStart(message: Pick<DMessage, 'generator' | 'fragments'>): boolean {
+  // FIXME: placeholder-check (see below) too here?
   return message.generator?.tokenStopReason === 'client-abort' && !message.fragments?.length;
 }
 
 // export function messageOnlyContainsPlaceholder(message: Pick<DMessage, 'fragments'>): boolean {
 //   return message.fragments.length === 1 && isVoidFragment(message.fragments[0]) && isPlaceholderPart(message.fragments[0].part);
 // }
+
+
+// helpers - generators
+
+export function messageSetGenerator(message: Pick<DMessage, 'generator'>, generator: undefined | DMessageGenerator): void {
+  if (generator !== undefined)
+    message.generator = generator;
+  else
+    delete message.generator;
+}
+
+export function messageSetGeneratorNamed(message: Pick<DMessage, 'generator'>, label: 'web' | 'issue' | 'help' | string): void {
+  message.generator = {
+    mgt: 'named',
+    name: label,
+  };
+}
+
+function _messageSetGeneratorAIX(message: Pick<DMessage, 'generator'>, modelLabel: string, modelVendorId: ModelVendorId, modelId: DLLMId): void {
+  message.generator = {
+    mgt: 'aix',
+    name: modelLabel,
+    aix: {
+      vId: modelVendorId,
+      mId: modelId,
+    },
+  };
+}
+
+export function messageSetGeneratorAIX_AutoLabel(message: Pick<DMessage, 'generator'>, modelVendorId: ModelVendorId, modelId: DLLMId): void {
+
+  // Strip the serviceId prefix: 'vendor-' or 'vendor-N-' (when multiple providers of same vendor)
+  const heuristicLabel = modelId.includes('-') ? modelId.replace(/^[^-]+-(\d-)?/, '') : modelId;
+
+  _messageSetGeneratorAIX(message, heuristicLabel, modelVendorId, modelId);
+}
+
+/*export function messageUpdateGeneratorInfo(message: Pick<DMessage, 'generator'>, metrics?: DMetricsChatGenerate_Md, tokenStopReason?: DMessageGenerator['tokenStopReason']): void {
+  if (!message.generator) return;
+  if (metrics) message.generator.metrics = metrics;
+  if (tokenStopReason) message.generator.tokenStopReason = tokenStopReason;
+}*/
 
 
 // helpers - user flags
@@ -258,7 +353,7 @@ export function messageSetUserFlag(message: Pick<DMessage, 'userFlags'>, flag: D
 export function messageFragmentsReduceText(fragments: DMessageFragment[], fragmentSeparator: string = '\n\n', excludeAttachmentFragments?: boolean): string {
 
   // quick path for empty fragments
-  if (!fragments.length)
+  if (!fragments?.length)
     return '';
 
   return fragments
