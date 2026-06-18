@@ -32,19 +32,20 @@ const filterLyingModelNames: GeminiWire_API_Models_List.Model['name'][] = [
   'models/gemini-flash-latest',
   'models/gemini-flash-lite-latest',
 
-  // 2025-02-27: verified, old model is no more
-  'models/gemini-2.0-flash-exp', // verified, replaced by gemini-2.0-flash, which is non-free anymore
-
-  // 2026-01-15: model shut down, superseded by gemini-2.5-flash-image
-  'models/gemini-2.5-flash-image-preview',
-
-  // 2026-03-09: model shut down, silently routed to gemini-3.1-pro-preview
+  // 2026-03-09: model shut down, silently routed to gemini-3.1-pro-preview (still returned by API)
   'models/gemini-3-pro-preview',
+];
 
-  // 2025-02-09 update: as of now they cleared the list, so we restart
-  // 2024-12-10: name of models that are not what they say they are (e.g. 1114 is actually 1121 as of )
-  'models/gemini-1.5-flash-8b-exp-0924', // replaced by non-free
-  'models/gemini-1.5-flash-8b-exp-0827', // replaced by non-free
+// Phantom models: listed by the API but return HTTP 'not found' on actual use (generateContent 404s).
+// Hidden entirely so users can't select a model that will fail. (Verified 2026-06-17.)
+// NOTE: we keep their _knownGeminiModels defs around on purpose - they're still resolved via
+// Vertex AI and OpenRouter->Gemini (llmOrtGemLookup). Expunge the defs from _knownGeminiModels
+// only once the native API stops returning them entirely.
+const filterNotFoundModelNames: GeminiWire_API_Models_List.Model['name'][] = [
+  'models/gemini-robotics-er-1.5-preview',
+  'models/gemini-2.0-flash-lite-001',
+  'models/gemini-2.0-flash-lite',
+  'models/gemini-2.0-flash',
 ];
 
 
@@ -54,7 +55,7 @@ const filterLyingModelNames: GeminiWire_API_Models_List.Model['name'][] = [
    - Latest stable     version  gemini-1.0-pro  <model>-<generation>-<variation>
    - Stable versions   gemini-1.0-pro-001       <model>-<generation>-<variation>-<version>
 
-   Gemini capabilities chart (updated 2026-06-09):
+   Gemini capabilities chart (updated 2026-06-16):
    - [table stakes] System instructions
    - JSON Mode, with optional JSON Schema
    - Adjustable Safety Settings
@@ -75,7 +76,7 @@ const geminiExpFree: ModelDescriptionSchema['chatPrice'] = {
 };
 
 
-// Pricing based on https://ai.google.dev/pricing (June 9, 2026)
+// Pricing based on https://ai.google.dev/pricing (June 16, 2026)
 
 const gemini35FlashPricing: ModelDescriptionSchema['chatPrice'] = {
   input: 1.50, // text/image/video; cache storage $1.00/MTok-hour (not tracked here)
@@ -313,7 +314,7 @@ const _knownGeminiModels = llmsDefineModels<_GeminiModelDef>()([
     benchmark: { cbaElo: 1438 }, // same lineage as gemini-3.1-flash-lite-preview
   },
 
-  // 3.1 Flash-Lite (Preview) - Released March 3, 2026; DEPRECATED: scheduled shutdown May 25, 2026 but still returned by API
+  // 3.1 Flash-Lite (Preview) - Released March 3, 2026; DEPRECATED: shutdown May 25, 2026 (still returned by API as of June 16, 2026)
   {
     hidden: true, // superseded by stable gemini-3.1-flash-lite (May 7, 2026)
     id: 'models/gemini-3.1-flash-lite-preview',
@@ -551,8 +552,8 @@ const _knownGeminiModels = llmsDefineModels<_GeminiModelDef>()([
     pubDate: '20251007',
     isPreview: true,
     chatPrice: gemini25ProPricing, // Uses same pricing as 2.5 Pro (pricing page doesn't list separately)
-    // NOTE: sweep shows fn=['auto'] only (no 'roundtrip') - partial Fn capability, do not advertise LLM_IF_OAI_Fn
-    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
+    // NOTE: sweep (2026-06) now shows fn=['auto','roundtrip'] - full function-calling roundtrip, advertise LLM_IF_OAI_Fn
+    interfaces: [LLM_IF_OAI_Chat, LLM_IF_OAI_Vision, LLM_IF_OAI_Fn, LLM_IF_OAI_Reasoning, LLM_IF_GEM_CodeExecution],
     parameterSpecs: [
       { paramId: 'llmVndGeminiThinkingBudget' },
       { paramId: 'llmVndGeminiComputerUse' }, // Sets environment=ENVIRONMENT_BROWSER in Computer Use tool
@@ -574,7 +575,7 @@ const _knownGeminiModels = llmsDefineModels<_GeminiModelDef>()([
     benchmark: undefined, // Robotics model, not benchmarkable on standard tests
   },
 
-  // 2.5 Flash-Based: Gemini Robotics-ER 1.5 Preview - DEPRECATED: scheduled shutdown April 30, 2026 but still returned by API
+  // 2.5 Flash-Based: Gemini Robotics-ER 1.5 Preview - DEPRECATED: shutdown April 30, 2026 (still returned by API as of June 16, 2026)
   {
     hidden: true, // superseded by Robotics-ER 1.6
     id: 'models/gemini-robotics-er-1.5-preview',
@@ -686,7 +687,7 @@ const _knownGeminiModels = llmsDefineModels<_GeminiModelDef>()([
   // REMOVED: models/gemini-exp-1206 (no longer returned by API as of March 2026)
   // REMOVED: models/gemini-2.0-flash-exp-image-generation (no longer returned by API as of March 2026)
 
-  // 2.0 Flash - DEPRECATED: scheduled shutdown June 1, 2026 but still returned by API
+  // 2.0 Flash - DEPRECATED: shutdown June 1, 2026 (still returned by API as of June 16, 2026)
   {
     hidden: true, // outclassed by all Flash models in 2.5/3.x series
     id: 'models/gemini-2.0-flash-001',
@@ -708,7 +709,7 @@ const _knownGeminiModels = llmsDefineModels<_GeminiModelDef>()([
     benchmark: { cbaElo: 1360 }, // gemini-2.0-flash
   },
 
-  // 2.0 Flash Lite - DEPRECATED: scheduled shutdown June 1, 2026 but still returned by API
+  // 2.0 Flash Lite - DEPRECATED: shutdown June 1, 2026 (still returned by API as of June 16, 2026)
   {
     hidden: true, // outclassed by 2.5/3.1 Flash-Lite
     id: 'models/gemini-2.0-flash-lite',
@@ -805,7 +806,7 @@ export function geminiValidateModelDefs_DEV(apiModels: GeminiWire_API_Models_Lis
   if (DEV_DEBUG_GEMINI_MODELS) {
     // Filter to chat-capable models first, then check for stale/unknown definitions
     const chatModelIds = apiModels.filter(geminiFilterModels).map(m => m.name);
-    const knownIds = _knownGeminiModels.filter(m => !filterLyingModelNames.includes(m.id)).map(m => m.id);
+    const knownIds = _knownGeminiModels.filter(m => !filterLyingModelNames.includes(m.id) && !filterNotFoundModelNames.includes(m.id)).map(m => m.id);
     llmDevCheckModels_DEV('Gemini', chatModelIds, knownIds);
   }
 
@@ -845,7 +846,8 @@ export function geminiFilterModels(geminiModel: GeminiWire_API_Models_List.Model
   // const isSupported = !filterUnallowedInterfaces.some(iface => geminiModel.supportedGenerationMethods.includes(iface));
   const isChatSupported = geminiModel.supportedGenerationMethods.some(iface => geminiChatInterfaces.includes(iface));
   const isWhatItSaysItIs = !filterLyingModelNames.includes(geminiModel.name);
-  return isAllowed && isChatSupported && isWhatItSaysItIs;
+  const isReachable = !filterNotFoundModelNames.includes(geminiModel.name); // drop API-listed but 404-on-use models
+  return isAllowed && isChatSupported && isWhatItSaysItIs && isReachable;
 }
 
 

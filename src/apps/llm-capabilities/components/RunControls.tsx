@@ -1,11 +1,12 @@
 import * as React from 'react';
 
 import { Box, Button, Chip, IconButton, LinearProgress, Option, Select, Stack, Tooltip, Typography } from '@mui/joy';
+import BuildCircleIcon from '@mui/icons-material/BuildCircle';
 import ClearIcon from '@mui/icons-material/Clear';
 import DownloadIcon from '@mui/icons-material/Download';
-import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import RefreshIcon from '@mui/icons-material/Refresh';
-import StopIcon from '@mui/icons-material/Stop';
+import StopRoundedIcon from '@mui/icons-material/StopRounded';
 
 
 export type DeclaredFcFilter = 'any' | 'yes' | 'no';
@@ -19,6 +20,7 @@ export interface RunControlsProps {
   onDeclaredFcFilterChange: (v: DeclaredFcFilter) => void;
   showHidden: boolean;
   onShowHiddenChange: (v: boolean) => void;
+  onOpenServices: () => void;
 
   // execution knobs
   concurrency: number;
@@ -50,7 +52,7 @@ export function RunControls(props: RunControlsProps) {
   const {
     vendors, selectedVendor, onSelectedVendorChange,
     declaredFcFilter, onDeclaredFcFilterChange,
-    showHidden, onShowHiddenChange,
+    showHidden, onShowHiddenChange, onOpenServices,
     concurrency, onConcurrencyChange,
     timeoutSec, onTimeoutSecChange,
     visibleCount, selectedCount, failingSelectedCount,
@@ -101,6 +103,18 @@ export function RunControls(props: RunControlsProps) {
           {showHidden ? 'Showing hidden' : 'Visible only'}
         </Button>
 
+        <Tooltip title='Open the AI Models configurator to add/remove services and edit per-model options.' size='sm'>
+          <Button
+            size='sm'
+            variant='outlined'
+            color='neutral'
+            startDecorator={<BuildCircleIcon />}
+            onClick={onOpenServices}
+          >
+            Services
+          </Button>
+        </Tooltip>
+
         <Box sx={{ flex: 1 }} />
 
         <Chip size='sm' variant='outlined'>{visibleCount} visible</Chip>
@@ -132,7 +146,7 @@ export function RunControls(props: RunControlsProps) {
             <Button
               size='sm'
               color='primary'
-              startDecorator={<PlayArrowIcon />}
+              startDecorator={<PlayArrowRoundedIcon />}
               onClick={onRunSelected}
               disabled={!canRun}
             >
@@ -160,7 +174,7 @@ export function RunControls(props: RunControlsProps) {
             size='sm'
             color='danger'
             variant='solid'
-            startDecorator={<StopIcon />}
+            startDecorator={<StopRoundedIcon />}
             onClick={onStop}
           >
             Stop
