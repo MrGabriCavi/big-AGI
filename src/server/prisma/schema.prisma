@@ -52,6 +52,17 @@ model LinkStorage {
   updatedAt DateTime @updatedAt
 }
 
+model AuthUser {
+  id String @id @default(uuid())
+
+  subject String @unique
+  email   String?
+  name    String?
+
+  createdAt   DateTime @default(now())
+  lastLoginAt DateTime
+}
+
 enum LinkStorageVisibility {
   PUBLIC
   UNLISTED
