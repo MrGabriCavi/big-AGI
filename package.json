@@ -8,7 +8,7 @@
   "scripts": {
     "predev": "node tools/develop/gen-devtools-workspace/generate-devtools-workspace.mjs",
     "predev-debug": "node tools/develop/gen-devtools-workspace/generate-devtools-workspace.mjs",
-    "dev": "next dev --turbopack",
+    "dev": "next dev",
     "dev-debug": "cross-env NODE_OPTIONS='--inspect' next dev",
     "dev-https": "next dev --experimental-https",
     "build": "next build",
